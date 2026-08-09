@@ -5,7 +5,7 @@
 
 const { createClient } = supabase;
 const CONFIG_OK = window.SUPABASE_URL && window.SUPABASE_ANON_KEY &&
-  !window.SUPABASE_URL.includes('PASTE_YOUR') && !window.SUPABASE_ANON_KEY.includes('PASTE_YOUR');
+  !window.SUPABASE_URL.includes('https://obabksylxiioijgnfswu.supabase.co') && !window.SUPABASE_ANON_KEY.includes('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9iYWJrc3lseGlpb2lqZ25mc3d1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYyODM5NjAsImV4cCI6MjEwMTg1OTk2MH0.3UQ4JLCIqI3v-om6JJLrj4isJCr6dcQQBq65zGAi13E');
 let db = null;
 if (CONFIG_OK) {
   try { db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); } catch (e) { db = null; }
