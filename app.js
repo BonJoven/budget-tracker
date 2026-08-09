@@ -4,7 +4,12 @@
    ============================================================ */
 
 const { createClient } = supabase;
-const db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+const CONFIG_OK = window.SUPABASE_URL && window.SUPABASE_ANON_KEY &&
+  !window.SUPABASE_URL.includes('PASTE_YOUR') && !window.SUPABASE_ANON_KEY.includes('PASTE_YOUR');
+let db = null;
+if (CONFIG_OK) {
+  try { db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); } catch (e) { db = null; }
+}
 
 const PESO = n => '₱' + Number(n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const $ = sel => document.querySelector(sel);
@@ -35,17 +40,36 @@ function toast(msg) {
 /* ---------------- AUTH ---------------- */
 
 async function initAuth() {
-  const { data, error } = await db.from('app_settings').select('*').eq('key', 'password_hash').maybeSingle();
-  if (error) {
-    $('#login-error').textContent = 'Could not reach the database. Check config.js values.';
+  if (!db) {
+    $('#login-screen').innerHTML = `
+      <div class="eyebrow" style="color:var(--red)">Setup needed</div>
+      <h1>config.js isn't filled in</h1>
+      <p style="color:var(--text-dim);max-width:360px;font-size:13px;">
+        Open <code>config.js</code> in your GitHub repo and make sure
+        SUPABASE_URL and SUPABASE_ANON_KEY are your real Supabase values
+        (not the placeholder text), then refresh this page.
+      </p>`;
     return;
   }
-  if (!data) {
-    renderSetupPassword();
-  } else if (localStorage.getItem('budget_unlocked') === 'true') {
-    enterApp();
-  } else {
-    renderLogin();
+  try {
+    const { data, error } = await db.from('app_settings').select('*').eq('key', 'password_hash').maybeSingle();
+    if (error) throw error;
+    if (!data) {
+      renderSetupPassword();
+    } else if (localStorage.getItem('budget_unlocked') === 'true') {
+      enterApp();
+    } else {
+      renderLogin();
+    }
+  } catch (e) {
+    $('#login-screen').innerHTML = `
+      <div class="eyebrow" style="color:var(--red)">Connection problem</div>
+      <h1>Can't reach the database</h1>
+      <p style="color:var(--text-dim);max-width:360px;font-size:13px;">${escapeHtml(e.message || String(e))}</p>
+      <p style="color:var(--text-dim);max-width:360px;font-size:12px;">
+        Common causes: the Supabase URL/key in config.js is wrong, the SQL
+        schema was never run, or the Supabase project is paused.
+      </p>`;
   }
 }
 
