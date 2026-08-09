@@ -5,7 +5,7 @@
 
 const { createClient } = supabase;
 const CONFIG_OK = window.SUPABASE_URL && window.SUPABASE_ANON_KEY &&
-  !window.SUPABASE_URL.includes('PASTE_YOUR') && !window.SUPABASE_ANON_KEY.includes('PASTE_YOUR');
+  !window.SUPABASE_URL.includes('https://obabksylxiioijgnfswu.supabase.co') && !window.SUPABASE_ANON_KEY.includes('PASTE_YOUR');
 let db = null;
 if (CONFIG_OK) {
   try { db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); } catch (e) { db = null; }
