@@ -5,7 +5,7 @@
 
 const { createClient } = supabase;
 const CONFIG_OK = window.SUPABASE_URL && window.SUPABASE_ANON_KEY &&
-  !window.SUPABASE_URL.includes('https://obabksylxiioijgnfswu.supabase.co') && !window.SUPABASE_ANON_KEY.includes('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9iYWJrc3lseGlpb2lqZ25mc3d1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYyODM5NjAsImV4cCI6MjEwMTg1OTk2MH0.3UQ4JLCIqI3v-om6JJLrj4isJCr6dcQQBq65zGAi13E');
+  !window.SUPABASE_URL.includes('https://obabksylxiioijgnfswu.supabase.co/rest/v1/') && !window.SUPABASE_ANON_KEY.includes('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9iYWJrc3lseGlpb2lqZ25mc3d1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYyODM5NjAsImV4cCI6MjEwMTg1OTk2MH0.3UQ4JLCIqI3v-om6JJLrj4isJCr6dcQQBq65zGAi13E');
 let db = null;
 if (CONFIG_OK) {
   try { db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); } catch (e) { db = null; }
@@ -20,6 +20,7 @@ let state = {
   periods: [],
   transactions: [],
   installments: [],
+  incomeItems: [],
   view: 'summary',
   txnPeriodId: null,
   installCardId: null,
@@ -135,16 +136,18 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: false }),
     db.from('transactions').select('*'),
     db.from('installments').select('*'),
+    db.from('income_items').select('*'),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
   state.transactions = transactions.data || [];
   state.installments = installments.data || [];
+  state.incomeItems = incomeItems.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
@@ -178,12 +181,17 @@ function cardTotalForPeriod(cardId, periodId) {
     .reduce((s, t) => s + Number(t.amount), 0);
 }
 
+function incomeItemsForPeriod(periodId) {
+  return state.incomeItems.filter(i => i.period_id === periodId);
+}
+
 function periodTotals(period) {
   const cardTotal = state.cards.reduce((s, c) => s + cardTotalForPeriod(c.id, period.id), 0);
-  const income = Number(period.salary) + Number(period.previous_savings) + Number(period.wifey);
+  const extraIncome = incomeItemsForPeriod(period.id).reduce((s, i) => s + Number(i.amount), 0);
+  const income = Number(period.salary) + Number(period.previous_savings) + Number(period.wifey) + extraIncome;
   const outflow = Number(period.accent) + Number(period.spaylater) + cardTotal;
   const savings = income - outflow;
-  return { cardTotal, income, outflow, savings };
+  return { cardTotal, income, outflow, savings, extraIncome };
 }
 
 /* ---------------- SUMMARY VIEW ---------------- */
@@ -223,6 +231,15 @@ function renderSummary() {
       <div class="line"><span class="lbl">Salary</span><span class="val">${PESO(p.salary)}</span></div>
       <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
       ${Number(p.wifey) ? `<div class="line"><span class="lbl">Wifey</span><span class="val">${PESO(p.wifey)}</span></div>` : ''}
+      ${incomeItemsForPeriod(p.id).map(item => `
+        <div class="line">
+          <span class="lbl">${escapeHtml(item.label)}
+            <button class="icon-btn edit" data-edit-income="${item.id}" style="width:20px;height:20px;font-size:10px;margin-left:4px;">✎</button>
+            <button class="icon-btn" data-del-income="${item.id}" style="width:20px;height:20px;font-size:10px;">✕</button>
+          </span>
+          <span class="val">${PESO(item.amount)}</span>
+        </div>`).join('')}
+      <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
       <div class="line"><span class="lbl">Accent (car)</span><span class="val">${PESO(p.accent)}</span></div>
       ${Number(p.spaylater) ? `<div class="line"><span class="lbl">Spaylater</span><span class="val">${PESO(p.spaylater)}</span></div>` : ''}
       ${state.cards.map(c => {
@@ -241,6 +258,41 @@ function renderSummary() {
     await db.from('periods').delete().eq('id', b.dataset.del);
     await loadAll(); renderView();
   });
+  $$('[data-add-income]').forEach(b => b.onclick = () => openIncomeItemModal(null, b.dataset.addIncome));
+  $$('[data-edit-income]').forEach(b => b.onclick = () => {
+    const item = state.incomeItems.find(x => x.id === b.dataset.editIncome);
+    openIncomeItemModal(item, item.period_id);
+  });
+  $$('[data-del-income]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this income line?')) return;
+    await db.from('income_items').delete().eq('id', b.dataset.delIncome);
+    await loadAll(); renderView();
+  });
+}
+
+function openIncomeItemModal(item, periodId) {
+  const isEdit = !!item;
+  const i = item || { label: '', amount: '' };
+  showModal(`
+    <h3>${isEdit ? 'Edit' : 'Add'} income line</h3>
+    <div class="field-row">
+      <div class="field"><label>Label</label><input type="text" id="f-label" value="${i.label ? escapeHtml(i.label) : ''}" placeholder="e.g. Part Time, JP, Bonus"></div>
+      <div class="field"><label>Amount</label><input type="number" step="0.01" id="f-amount" value="${i.amount}"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-save">Save</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const payload = { label: $('#f-label').value.trim(), amount: +$('#f-amount').value || 0, period_id: periodId };
+    if (!payload.label) { toast('Add a label'); return; }
+    let error;
+    if (isEdit) ({ error } = await db.from('income_items').update(payload).eq('id', i.id));
+    else ({ error } = await db.from('income_items').insert(payload));
+    if (error) { toast(error.message); return; }
+    closeModal(); await loadAll(); renderView();
+  };
 }
 
 function openPeriodModal(period) {
