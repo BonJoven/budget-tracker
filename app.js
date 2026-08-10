@@ -22,6 +22,7 @@ let state = {
   periods: [],
   transactions: [],
   installments: [],
+  installmentSchedule: [],
   incomeItems: [],
   justineMonths: [],
   justineBills: [],
@@ -153,7 +154,7 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: true }),
     db.from('transactions').select('*'),
@@ -161,6 +162,7 @@ async function loadAll() {
     db.from('income_items').select('*'),
     db.from('justine_months').select('*').order('month_date', { ascending: false }),
     db.from('justine_bills').select('*'),
+    db.from('installment_schedule').select('*').order('due_date', { ascending: true }),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
@@ -169,6 +171,7 @@ async function loadAll() {
   state.incomeItems = incomeItems.data || [];
   state.justineMonths = justineMonths.data || [];
   state.justineBills = justineBills.data || [];
+  state.installmentSchedule = schedule.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
@@ -220,9 +223,76 @@ function renderView() {
 /* ---------------- helpers: computed numbers ---------------- */
 
 function cardTotalForPeriod(cardId, periodId) {
-  return state.transactions
+  const real = state.transactions
     .filter(t => t.card_id === cardId && t.period_id === periodId)
     .reduce((s, t) => s + Number(t.amount), 0);
+  const virtual = virtualEntriesForPeriod(periodId)
+    .filter(e => e.card_id === cardId)
+    .reduce((s, e) => s + e.amount, 0);
+  return real + virtual;
+}
+
+/* ---- linking Justine's "billed to Joven" installments into Joven's periods ---- */
+
+function periodKeyForDate(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  return { mk, type: d.getDate() <= 15 ? '15th' : '30th' };
+}
+function periodIdForDate(dateStr) {
+  const { mk, type } = periodKeyForDate(dateStr);
+  const p = state.periods.find(p => monthKey(p.period_date) === mk && p.period_type === type);
+  return p ? p.id : null;
+}
+function scheduleForInstallment(installId) {
+  return state.installmentSchedule.filter(s => s.installment_id === installId).sort((a, b) => a.due_date < b.due_date ? -1 : 1);
+}
+// Justine's installments that Joven actually pays through one of his own cards,
+// surfaced as read-only "auto" entries on his Transactions tab for the matching period.
+function virtualEntriesForPeriod(periodId) {
+  const entries = [];
+  state.installments.filter(i => i.owner === 'justine' && i.billed_to_card_id && !i.archived).forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      if (periodIdForDate(row.due_date) === periodId) {
+        entries.push({
+          id: 'virtual-' + row.id,
+          description: inst.name,
+          amount: Number(row.amount),
+          wifey_share: Number(row.amount), // fully hers - Joven is fronting it
+          kind: 'payment_plan',
+          card_id: inst.billed_to_card_id,
+          virtual: true,
+        });
+      }
+    });
+  });
+  return entries;
+}
+// Sum of the above for a whole calendar month (both the 15th and 30th periods),
+// used to avoid double-counting on Justine's side.
+function jovenBilledInstallmentsTotalForMonth(monthDate) {
+  const mk = monthKey(monthDate);
+  const p15 = state.periods.find(p => p.period_type === '15th' && monthKey(p.period_date) === mk);
+  const p30 = state.periods.find(p => p.period_type === '30th' && monthKey(p.period_date) === mk);
+  let total = 0;
+  if (p15) total += virtualEntriesForPeriod(p15.id).reduce((s, e) => s + e.amount, 0);
+  if (p30) total += virtualEntriesForPeriod(p30.id).reduce((s, e) => s + e.amount, 0);
+  return total;
+}
+
+function generateScheduleRows(inst) {
+  const rows = [];
+  const start = new Date(inst.start_date + 'T00:00:00');
+  for (let i = 0; i < inst.num_months; i++) {
+    const d = new Date(start);
+    d.setMonth(d.getMonth() + i);
+    rows.push({
+      due_date: d.toISOString().slice(0, 10),
+      amount: Number(inst.monthly_amount) + (i === 0 ? Number(inst.fee || 0) : 0),
+      wifey_share: Number(inst.wifey_monthly_share || 0) + (i === 0 ? Number(inst.wifey_fee_share || 0) : 0),
+    });
+  }
+  return rows;
 }
 
 function incomeItemsForPeriod(periodId) {
@@ -230,9 +300,11 @@ function incomeItemsForPeriod(periodId) {
 }
 
 function wifeyTotalForPeriod(periodId) {
-  return state.transactions
+  const real = state.transactions
     .filter(t => t.period_id === periodId)
     .reduce((s, t) => s + Number(t.wifey_share || 0), 0);
+  const virtual = virtualEntriesForPeriod(periodId).reduce((s, e) => s + e.wifey_share, 0);
+  return real + virtual;
 }
 
 function periodTotals(period) {
@@ -426,7 +498,8 @@ function renderTransactions() {
   }
   state.cards.filter(c => !c.archived).forEach(card => {
     const rows = state.transactions.filter(t => t.card_id === card.id && t.period_id === period.id);
-    const total = rows.reduce((s, t) => s + Number(t.amount), 0);
+    const virtualRows = virtualEntriesForPeriod(period.id).filter(e => e.card_id === card.id);
+    const total = rows.reduce((s, t) => s + Number(t.amount), 0) + virtualRows.reduce((s, e) => s + e.amount, 0);
     const sec = document.createElement('div');
     sec.className = 'section-card';
     sec.innerHTML = `
@@ -437,7 +510,7 @@ function renderTransactions() {
           <button class="btn secondary" data-add="${card.id}" style="padding:6px 12px;font-size:13px;">+ Add</button>
         </div>
       </div>
-      ${rows.length ? `<table>
+      ${(rows.length || virtualRows.length) ? `<table>
         <thead><tr><th>Description</th><th>Type</th><th>Split</th><th class="num">Amount</th><th></th></tr></thead>
         <tbody>
           ${rows.map(t => {
@@ -459,6 +532,14 @@ function renderTransactions() {
               </td>
             </tr>`;
           }).join('')}
+          ${virtualRows.map(e => `
+            <tr style="opacity:.8;">
+              <td>${escapeHtml(e.description)} <span class="synced-badge" title="Auto-added from Justine's installment plan - edit it on her Installments tab">⇄ auto</span></td>
+              <td><span class="pill payment_plan">Payment plan</span></td>
+              <td><span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Wifey's</span></td>
+              <td class="num">${PESO(e.amount)}</td>
+              <td></td>
+            </tr>`).join('')}
         </tbody>
       </table>` : `<div class="empty-state">No transactions yet for this card in this period.</div>`}
     `;
@@ -543,22 +624,23 @@ function openTxnModal(txn, cardId, periodId) {
 
 /* ---------------- INSTALLMENTS VIEW ---------------- */
 
-function monthsElapsed(startDate) {
-  const start = new Date(startDate + 'T00:00:00');
-  const now = new Date();
-  return (now.getFullYear() - start.getFullYear()) * 12 + (now.getMonth() - start.getMonth()) + 1;
+function scheduleStatus(dueDateStr) {
+  const due = new Date(dueDateStr + 'T00:00:00');
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  if (due < today) return 'paid';
+  return 'upcoming';
 }
-function endDate(startDate, numMonths) {
-  const d = new Date(startDate + 'T00:00:00');
-  d.setMonth(d.getMonth() + numMonths - 1);
-  return d;
+function nextDueRowId(schedule) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const future = schedule.filter(r => new Date(r.due_date + 'T00:00:00') >= today);
+  return future.length ? future[0].id : null;
 }
 
 function renderInstallments() {
   const main = $('#main');
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Installments</h2><div class="subtitle">Payment plans and when each one finishes</div></div>
+      <div><h2>Installments</h2><div class="subtitle">Payment plans, split by period, and when each one finishes</div></div>
       <button class="btn" id="add-install-btn">+ New installment</button>
     </div>
     <div class="card-select-tabs" id="install-tabs"></div>
@@ -578,38 +660,113 @@ function renderInstallments() {
 
   list.forEach(i => {
     const card = state.cards.find(c => c.id === i.card_id);
-    const elapsed = Math.min(Math.max(monthsElapsed(i.start_date), 0), i.num_months);
-    const pct = Math.round((elapsed / i.num_months) * 100);
-    const done = elapsed >= i.num_months;
-    const end = endDate(i.start_date, i.num_months);
+    const schedule = scheduleForInstallment(i.id);
+    const paidCount = schedule.filter(r => scheduleStatus(r.due_date) === 'paid').length;
+    const pct = schedule.length ? Math.round((paidCount / schedule.length) * 100) : 0;
+    const done = schedule.length > 0 && paidCount >= schedule.length;
+    const nextId = nextDueRowId(schedule);
+    const lastRow = schedule[schedule.length - 1];
+    const totalToPay = schedule.reduce((s, r) => s + Number(r.amount), 0);
+    const principal = Number(i.principal) || 0;
+    const interest = Math.max(totalToPay - principal, 0);
+    const interestPct = totalToPay > 0 ? Math.round((interest / totalToPay) * 100) : 0;
+    const billedCard = i.billed_to_card_id ? state.cards.find(c => c.id === i.billed_to_card_id) : null;
+
     const el = document.createElement('div');
     el.className = 'install-item' + (done ? ' done' : '');
     el.innerHTML = `
       <div class="name">${escapeHtml(i.name)}</div>
       <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : '#888'}"></span>${card ? card.name : 'Unknown'} • ${PESO(i.monthly_amount)}/mo</div>
+      ${billedCard ? `<div class="meta" style="color:var(--blue);">⇄ billed on ${escapeHtml(billedCard.name)}'s statement</div>` : ''}
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%;background:${done ? 'var(--green)' : 'var(--gold)'}"></div></div>
       <div class="foot">
-        <span>${done ? 'Completed' : `Month ${elapsed} of ${i.num_months}`}</span>
-        <span class="end">${done ? '✓ Paid off' : 'ends ' + end.toLocaleDateString('en-PH', { month: 'short', year: 'numeric' })}</span>
+        <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}</span>
+        <span class="end">${done ? '✓ Paid off' : lastRow ? 'ends ' + new Date(lastRow.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }) : ''}</span>
       </div>
-      <div style="margin-top:10px;text-align:right;">
-        <button class="icon-btn edit" data-edit-i="${i.id}">✎</button>
-        <button class="icon-btn" data-del-i="${i.id}">✕</button>
+      ${principal > 0 ? `
+      <div style="margin-top:10px;">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-bottom:3px;">
+          <span>Principal ${PESO(principal)}</span><span>Interest/fee ${PESO(interest)} (${interestPct}%)</span>
+        </div>
+        <div class="progress-track" style="height:8px;">
+          <div style="height:100%;width:${100 - interestPct}%;background:var(--blue);float:left;"></div>
+          <div style="height:100%;width:${interestPct}%;background:var(--red);float:left;"></div>
+        </div>
+      </div>` : ''}
+      <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
+        <button class="btn secondary" data-view-sched="${i.id}" style="padding:6px 12px;font-size:12px;">View schedule</button>
+        <div>
+          <button class="icon-btn edit" data-edit-i="${i.id}">✎</button>
+          <button class="icon-btn" data-del-i="${i.id}">✕</button>
+        </div>
       </div>
     `;
     grid.appendChild(el);
   });
   $$('[data-edit-i]').forEach(b => b.onclick = () => openInstallModal(state.installments.find(x => x.id === b.dataset.editI)));
+  $$('[data-view-sched]').forEach(b => b.onclick = () => openScheduleModal(state.installments.find(x => x.id === b.dataset.viewSched)));
   $$('[data-del-i]').forEach(b => b.onclick = async () => {
-    if (!confirm('Delete this installment plan?')) return;
+    if (!confirm('Delete this installment plan and its schedule?')) return;
     await db.from('installments').delete().eq('id', b.dataset.delI);
     await loadAll(); renderView();
   });
 }
 
+async function regenerateSchedule(inst) {
+  await db.from('installment_schedule').delete().eq('installment_id', inst.id);
+  const rows = generateScheduleRows(inst).map((r, idx) => ({
+    installment_id: inst.id, due_date: r.due_date, amount: r.amount, wifey_share: r.wifey_share, is_fee_row: idx === 0,
+  }));
+  if (rows.length) await db.from('installment_schedule').insert(rows);
+}
+
+function openScheduleModal(inst) {
+  const schedule = scheduleForInstallment(inst.id);
+  const nextId = nextDueRowId(schedule);
+  const counterpartLabel = inst.owner === 'joven' ? "Wifey's share" : "Joven's share";
+  showModal(`
+    <h3>${escapeHtml(inst.name)} — schedule</h3>
+    <p style="font-size:12px;color:var(--text-dim);margin-top:-8px;">Green = already paid. Gold = next due. Edit ${counterpartLabel.toLowerCase()} per period if it ever changes.</p>
+    <div style="max-height:50vh;overflow-y:auto;">
+    <table>
+      <thead><tr><th>Due</th><th class="num">Amount</th><th class="num">${counterpartLabel}</th><th></th></tr></thead>
+      <tbody id="sched-body">
+        ${schedule.map(r => {
+          const status = scheduleStatus(r.due_date);
+          const isNext = r.id === nextId;
+          const rowColor = status === 'paid' ? 'rgba(79,216,151,.08)' : isNext ? 'rgba(227,177,88,.12)' : 'transparent';
+          return `
+          <tr style="background:${rowColor};">
+            <td>${new Date(r.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })} ${isNext ? '<span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);">next due</span>' : status === 'paid' ? '<span class="synced-badge">paid</span>' : ''}${r.is_fee_row ? ' <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);">+fee</span>' : ''}</td>
+            <td class="num">${PESO(r.amount)}</td>
+            <td class="num"><input type="number" step="0.01" data-row-id="${r.id}" value="${r.wifey_share}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;"></td>
+            <td></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Close</button>
+      <button class="btn" id="modal-save">Save changes</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const inputs = $$('#sched-body input[data-row-id]');
+    for (const inp of inputs) {
+      await db.from('installment_schedule').update({ wifey_share: +inp.value || 0 }).eq('id', inp.dataset.rowId);
+    }
+    closeModal(); await loadAll(); renderView();
+  };
+}
+
 function openInstallModal(item) {
   const isEdit = !!item;
-  const i = item || { card_id: state.cards[0]?.id || '', name: '', principal: '', fee: 0, monthly_amount: '', start_date: '', num_months: 12, payer: '' };
+  const i = item || {
+    card_id: state.cards[0]?.id || '', name: '', principal: '', fee: 0, monthly_amount: '', start_date: '',
+    num_months: 12, payer: '', wifey_monthly_share: 0, wifey_fee_share: 0, billed_to_card_id: '',
+  };
+  const counterpartLabel = state.profile === 'joven' ? "Wifey's" : "Joven's";
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} installment</h3>
     <div class="field-row">
@@ -621,15 +778,29 @@ function openInstallModal(item) {
     <div class="field-row">
       <div class="field"><label>Principal</label><input type="number" step="0.01" id="f-principal" value="${i.principal}"></div>
       <div class="field"><label>Fee</label><input type="number" step="0.01" id="f-fee" value="${i.fee}"></div>
+      <div class="field"><label>${counterpartLabel} share of the fee</label><input type="number" step="0.01" id="f-feeshare" value="${i.wifey_fee_share}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Monthly amount</label><input type="number" step="0.01" id="f-monthly" value="${i.monthly_amount}"></div>
       <div class="field"><label># of months</label><input type="number" id="f-months" value="${i.num_months}"></div>
+      <div class="field"><label>${counterpartLabel} share (per month)</label><input type="number" step="0.01" id="f-monthlyshare" value="${i.wifey_monthly_share}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Start date</label><input type="date" id="f-start" value="${i.start_date}"></div>
       <div class="field"><label>Payer / note</label><input type="text" id="f-payer" value="${i.payer ? escapeHtml(i.payer) : ''}" placeholder="e.g. Justine"></div>
     </div>
+    ${state.profile === 'justine' ? `
+    <div class="field-row">
+      <div class="field"><label>Actually billed on Joven's card?</label>
+        <select id="f-billed">
+          <option value="">No — billed on her own card above</option>
+          ${state.cards.map(c => `<option value="${c.id}" ${i.billed_to_card_id === c.id ? 'selected' : ''}>${c.name} (his)</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);">If set, this shows up automatically on Joven's Transactions tab and reduces her "Joven CC Total" each period — no manual re-entry.</p>
+    ` : ''}
+    ${isEdit ? `<p style="font-size:12px;color:var(--text-dim);">Changing amount/months/start date regenerates the schedule and resets any per-period edits you made in "View schedule".</p>` : ''}
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -641,16 +812,24 @@ function openInstallModal(item) {
       name: $('#f-name').value.trim(),
       principal: +$('#f-principal').value || null,
       fee: +$('#f-fee').value || 0,
+      wifey_fee_share: +$('#f-feeshare').value || 0,
       monthly_amount: +$('#f-monthly').value || 0,
+      wifey_monthly_share: +$('#f-monthlyshare').value || 0,
       num_months: +$('#f-months').value || 1,
       start_date: $('#f-start').value,
       payer: $('#f-payer').value.trim(),
+      billed_to_card_id: state.profile === 'justine' ? ($('#f-billed').value || null) : null,
     };
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
-    let error;
-    if (isEdit) ({ error } = await db.from('installments').update(payload).eq('id', i.id));
-    else ({ error } = await db.from('installments').insert({ ...payload, owner: state.profile }));
+    let error, savedId = i.id;
+    if (isEdit) {
+      ({ error } = await db.from('installments').update(payload).eq('id', i.id));
+    } else {
+      const res = await db.from('installments').insert({ ...payload, owner: state.profile }).select().single();
+      error = res.error; savedId = res.data ? res.data.id : null;
+    }
     if (error) { toast(error.message); return; }
+    if (savedId) await regenerateSchedule({ ...payload, id: savedId });
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -752,10 +931,12 @@ function justineBillsForMonth(monthId) {
 function justineTotals(m) {
   const { kuya15, kuya30 } = jovenAccentForMonth(m.month_date);
   const billsTotal = justineBillsForMonth(m.id).reduce((s, b) => s + Number(b.amount), 0);
+  const billedByJoven = jovenBilledInstallmentsTotalForMonth(m.month_date);
+  const jovenCcNet = Math.max(Number(m.joven_cc_total) - billedByJoven, 0);
   const payablesTotal = Number(m.bpi_total) + Number(m.eastwest_total) + billsTotal + kuya15 + kuya30;
-  const totalOutflow = Number(m.joven_cc_total) + payablesTotal;
+  const totalOutflow = jovenCcNet + payablesTotal;
   const savings = Number(m.paycheck_budget) - totalOutflow;
-  return { kuya15, kuya30, billsTotal, payablesTotal, totalOutflow, savings };
+  return { kuya15, kuya30, billsTotal, payablesTotal, totalOutflow, savings, billedByJoven, jovenCcNet };
 }
 
 function renderJustineSummary() {
@@ -791,6 +972,8 @@ function renderJustineSummary() {
       <div class="line"><span class="lbl">15th Paycheck Budget</span><span class="val">${PESO(m.paycheck_budget)}</span></div>
       <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(m.previous_savings)}</span></div>
       <div class="line"><span class="lbl">Joven CC Total</span><span class="val">${PESO(m.joven_cc_total)}</span></div>
+      ${t.billedByJoven > 0 ? `<div class="line"><span class="lbl" style="padding-left:12px;color:var(--green);">− billed directly to his cards <span class="synced-badge" title="Auto-subtracted: these installments are hers but Joven pays them via his own card, so she doesn't owe him separately for them">⇄ auto</span></span><span class="val" style="color:var(--green);">−${PESO(t.billedByJoven)}</span></div>
+      <div class="line"><span class="lbl" style="padding-left:12px;">= net owed to Joven</span><span class="val">${PESO(t.jovenCcNet)}</span></div>` : ''}
       <div class="line"><span class="lbl">BPI</span><span class="val">${PESO(m.bpi_total)}</span></div>
       <div class="line"><span class="lbl">Eastwest</span><span class="val">${PESO(m.eastwest_total)}</span></div>
       ${justineBillsForMonth(m.id).map(b => `
