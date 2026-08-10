@@ -5,7 +5,7 @@
 
 const { createClient } = supabase;
 const CONFIG_OK = window.SUPABASE_URL && window.SUPABASE_ANON_KEY &&
-  !window.SUPABASE_URL.includes('https://obabksylxiioijgnfswu.supabase.co') && !window.SUPABASE_ANON_KEY.includes('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9iYWJrc3lseGlpb2lqZ25mc3d1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYyODM5NjAsImV4cCI6MjEwMTg1OTk2MH0.3UQ4JLCIqI3v-om6JJLrj4isJCr6dcQQBq65zGAi13E');
+  !window.SUPABASE_URL.includes('PASTE_YOUR') && !window.SUPABASE_ANON_KEY.includes('PASTE_YOUR');
 let db = null;
 if (CONFIG_OK) {
   try { db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); } catch (e) { db = null; }
@@ -21,6 +21,9 @@ let state = {
   transactions: [],
   installments: [],
   incomeItems: [],
+  justineMonths: [],
+  justineBills: [],
+  profile: 'joven',       // 'joven' or 'justine'
   view: 'summary',
   txnPeriodId: null,
   installCardId: null,
@@ -136,37 +139,64 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments, incomeItems] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: false }),
     db.from('transactions').select('*'),
     db.from('installments').select('*'),
     db.from('income_items').select('*'),
+    db.from('justine_months').select('*').order('month_date', { ascending: false }),
+    db.from('justine_bills').select('*'),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
   state.transactions = transactions.data || [];
-  state.installments = installments.data || [];
+  state.installments = (installments.data || []).map(i => ({ ...i, owner: i.owner || 'joven' }));
   state.incomeItems = incomeItems.data || [];
+  state.justineMonths = justineMonths.data || [];
+  state.justineBills = justineBills.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
 
 function renderSidebar() {
-  $('#sidebar').innerHTML = `
-    <div class="brand"><span class="dot"></span> Household Budget</div>
+  const jovenNav = `
     <button class="nav-btn" data-view="summary">Summary</button>
     <button class="nav-btn" data-view="transactions">Transactions</button>
     <button class="nav-btn" data-view="installments">Installments</button>
     <button class="nav-btn" data-view="settings">Cards & Settings</button>
+  `;
+  const justineNav = `
+    <button class="nav-btn" data-view="summary">Summary</button>
+    <button class="nav-btn" data-view="installments">Installments</button>
+  `;
+  $('#sidebar').innerHTML = `
+    <div class="brand"><span class="dot"></span> Household Budget</div>
+    <div class="profile-switch" id="profile-switch">
+      <button data-profile="joven" class="${state.profile === 'joven' ? 'active' : ''}"><span class="avatar">J</span>Joven</button>
+      <button data-profile="justine" class="${state.profile === 'justine' ? 'active' : ''}"><span class="avatar">J</span>Justine</button>
+    </div>
+    ${state.profile === 'joven' ? jovenNav : justineNav}
     <div class="footer"><button class="btn secondary" id="logout-btn">Log out</button></div>
   `;
+  $$('#profile-switch button').forEach(b => b.onclick = () => {
+    state.profile = b.dataset.profile;
+    state.view = 'summary';
+    renderSidebar();
+    renderView();
+  });
   $$('.nav-btn').forEach(b => b.onclick = () => { state.view = b.dataset.view; renderView(); });
   $('#logout-btn').onclick = logout;
 }
 
 function renderView() {
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === state.view));
+  if (state.profile === 'justine') {
+    if (state.view === 'summary') renderJustineSummary();
+    else if (state.view === 'installments') renderInstallments();
+    else renderJustineSummary();
+    return;
+  }
   if (state.view === 'summary') renderSummary();
   else if (state.view === 'transactions') renderTransactions();
   else if (state.view === 'installments') renderInstallments();
@@ -490,7 +520,7 @@ function renderInstallments() {
   $$('#install-tabs button').forEach(b => b.onclick = () => { state.installCardId = b.dataset.c === 'all' ? null : b.dataset.c; renderInstallments(); });
 
   const grid = $('#install-grid');
-  let list = state.installments.filter(i => !i.archived);
+  let list = state.installments.filter(i => !i.archived && i.owner === state.profile);
   if (state.installCardId) list = list.filter(i => i.card_id === state.installCardId);
   if (!list.length) { grid.innerHTML = `<div class="empty-state">No installments here yet.</div>`; return; }
 
@@ -567,7 +597,7 @@ function openInstallModal(item) {
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
     let error;
     if (isEdit) ({ error } = await db.from('installments').update(payload).eq('id', i.id));
-    else ({ error } = await db.from('installments').insert(payload));
+    else ({ error } = await db.from('installments').insert({ ...payload, owner: state.profile }));
     if (error) { toast(error.message); return; }
     closeModal(); await loadAll(); renderView();
   };
@@ -646,6 +676,170 @@ function openCardModal(card) {
     let error;
     if (isEdit) ({ error } = await db.from('credit_cards').update(payload).eq('id', c.id));
     else ({ error } = await db.from('credit_cards').insert({ ...payload, sort_order: c.sort_order }));
+    if (error) { toast(error.message); return; }
+    closeModal(); await loadAll(); renderView();
+  };
+}
+
+/* ---------------- JUSTINE'S BUDGET (monthly, simpler) ---------------- */
+
+function monthKey(dateStr) { return dateStr.slice(0, 7); } // "2026-08"
+
+function jovenAccentForMonth(monthDate) {
+  // Pulls "Accent" from Joven's 15th and 30th periods in the same calendar month
+  const mk = monthKey(monthDate);
+  const p15 = state.periods.find(p => p.period_type === '15th' && monthKey(p.period_date) === mk);
+  const p30 = state.periods.find(p => p.period_type === '30th' && monthKey(p.period_date) === mk);
+  return { kuya15: p15 ? Number(p15.accent) : 0, kuya30: p30 ? Number(p30.accent) : 0, hasP15: !!p15, hasP30: !!p30 };
+}
+
+function justineBillsForMonth(monthId) {
+  return state.justineBills.filter(b => b.month_id === monthId);
+}
+
+function justineTotals(m) {
+  const { kuya15, kuya30 } = jovenAccentForMonth(m.month_date);
+  const billsTotal = justineBillsForMonth(m.id).reduce((s, b) => s + Number(b.amount), 0);
+  const payablesTotal = Number(m.bpi_total) + Number(m.eastwest_total) + billsTotal + kuya15 + kuya30;
+  const totalOutflow = Number(m.joven_cc_total) + payablesTotal;
+  const savings = Number(m.paycheck_budget) - totalOutflow;
+  return { kuya15, kuya30, billsTotal, payablesTotal, totalOutflow, savings };
+}
+
+function renderJustineSummary() {
+  const main = $('#main');
+  main.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-end;">
+      <div><h2>Justine's Budget</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
+      <button class="btn" id="add-month-btn">+ New month</button>
+    </div>
+    <div class="period-grid" id="month-grid"></div>
+  `;
+  $('#add-month-btn').onclick = () => openJustineMonthModal();
+
+  const grid = $('#month-grid');
+  if (!state.justineMonths.length) {
+    grid.innerHTML = `<div class="empty-state">No months yet. Click "New month" to add August.</div>`;
+    return;
+  }
+  state.justineMonths.forEach(m => {
+    const t = justineTotals(m);
+    const monthLabel = new Date(m.month_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
+    const acc = jovenAccentForMonth(m.month_date);
+    const el = document.createElement('div');
+    el.className = 'period-card';
+    el.innerHTML = `
+      <div class="ph">
+        <div><span class="tag">${monthLabel}</span></div>
+        <div>
+          <button class="icon-btn edit" data-edit-m="${m.id}" title="Edit">✎</button>
+          <button class="icon-btn" data-del-m="${m.id}" title="Delete">✕</button>
+        </div>
+      </div>
+      <div class="line"><span class="lbl">15th Paycheck Budget</span><span class="val">${PESO(m.paycheck_budget)}</span></div>
+      <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(m.previous_savings)}</span></div>
+      <div class="line"><span class="lbl">Joven CC Total</span><span class="val">${PESO(m.joven_cc_total)}</span></div>
+      <div class="line"><span class="lbl">BPI</span><span class="val">${PESO(m.bpi_total)}</span></div>
+      <div class="line"><span class="lbl">Eastwest</span><span class="val">${PESO(m.eastwest_total)}</span></div>
+      ${justineBillsForMonth(m.id).map(b => `
+        <div class="line">
+          <span class="lbl">${escapeHtml(b.label)}
+            <button class="icon-btn edit" data-edit-bill="${b.id}" style="width:20px;height:20px;font-size:10px;margin-left:4px;">✎</button>
+            <button class="icon-btn" data-del-bill="${b.id}" style="width:20px;height:20px;font-size:10px;">✕</button>
+          </span>
+          <span class="val">${PESO(b.amount)}</span>
+        </div>`).join('')}
+      <div class="line"><span class="lbl"><button class="icon-btn" data-add-bill="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ bill</button></span><span class="val"></span></div>
+      <div class="line"><span class="lbl">Kuya Edrian 15 <span class="synced-badge" title="Same as Joven's Accent, pulled automatically">⇄ synced</span></span><span class="val">${acc.hasP15 ? PESO(t.kuya15) : '<span style="color:var(--text-dim)">no 15th period yet</span>'}</span></div>
+      <div class="line"><span class="lbl">Kuya Edrian 30 <span class="synced-badge" title="Same as Joven's Accent, pulled automatically">⇄ synced</span></span><span class="val">${acc.hasP30 ? PESO(t.kuya30) : '<span style="color:var(--text-dim)">no 30th period yet</span>'}</span></div>
+      <div class="line"><span class="lbl">Payables total</span><span class="val">${PESO(t.payablesTotal)}</span></div>
+      <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.totalOutflow)}</span></div>
+      <div class="line savings total"><span class="lbl">Savings</span><span class="val">${PESO(t.savings)}</span></div>
+    `;
+    grid.appendChild(el);
+  });
+  $$('[data-edit-m]').forEach(b => b.onclick = () => openJustineMonthModal(state.justineMonths.find(m => m.id === b.dataset.editM)));
+  $$('[data-del-m]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this month?')) return;
+    await db.from('justine_months').delete().eq('id', b.dataset.delM);
+    await loadAll(); renderView();
+  });
+  $$('[data-add-bill]').forEach(b => b.onclick = () => openJustineBillModal(null, b.dataset.addBill));
+  $$('[data-edit-bill]').forEach(b => b.onclick = () => {
+    const bill = state.justineBills.find(x => x.id === b.dataset.editBill);
+    openJustineBillModal(bill, bill.month_id);
+  });
+  $$('[data-del-bill]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this bill?')) return;
+    await db.from('justine_bills').delete().eq('id', b.dataset.delBill);
+    await loadAll(); renderView();
+  });
+}
+
+function openJustineMonthModal(month) {
+  const isEdit = !!month;
+  const m = month || { month_date: '', paycheck_budget: 0, previous_savings: 0, joven_cc_total: 0, bpi_total: 0, eastwest_total: 0 };
+  showModal(`
+    <h3>${isEdit ? 'Edit' : 'New'} month</h3>
+    <div class="field-row">
+      <div class="field"><label>Month</label><input type="month" id="f-month" value="${m.month_date ? m.month_date.slice(0, 7) : ''}"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>15th Paycheck Budget</label><input type="number" step="0.01" id="f-budget" value="${m.paycheck_budget}"></div>
+      <div class="field"><label>Previous savings</label><input type="number" step="0.01" id="f-prev" value="${m.previous_savings}"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Joven CC Total</label><input type="number" step="0.01" id="f-joven" value="${m.joven_cc_total}"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>BPI</label><input type="number" step="0.01" id="f-bpi" value="${m.bpi_total}"></div>
+      <div class="field"><label>Eastwest</label><input type="number" step="0.01" id="f-ew" value="${m.eastwest_total}"></div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);">Kuya Edrian 15/30 aren't entered here — they're pulled automatically from Joven's Accent on his 15th/30th periods for this same month.</p>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-save">Save</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const monthVal = $('#f-month').value; // "2026-08"
+    if (!monthVal) { toast('Pick a month'); return; }
+    const payload = {
+      month_date: monthVal + '-01',
+      paycheck_budget: +$('#f-budget').value || 0,
+      previous_savings: +$('#f-prev').value || 0,
+      joven_cc_total: +$('#f-joven').value || 0,
+      bpi_total: +$('#f-bpi').value || 0,
+      eastwest_total: +$('#f-ew').value || 0,
+    };
+    let error;
+    if (isEdit) ({ error } = await db.from('justine_months').update(payload).eq('id', m.id));
+    else ({ error } = await db.from('justine_months').insert(payload));
+    if (error) { toast(error.message); return; }
+    closeModal(); await loadAll(); renderView();
+  };
+}
+
+function openJustineBillModal(bill, monthId) {
+  const isEdit = !!bill;
+  const b = bill || { label: '', amount: '' };
+  showModal(`
+    <h3>${isEdit ? 'Edit' : 'Add'} bill</h3>
+    <div class="field-row">
+      <div class="field"><label>Label</label><input type="text" id="f-label" value="${b.label ? escapeHtml(b.label) : ''}" placeholder="e.g. Cat Food, PLDT, St. Peter"></div>
+      <div class="field"><label>Amount</label><input type="number" step="0.01" id="f-amount" value="${b.amount}"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-save">Save</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const payload = { label: $('#f-label').value.trim(), amount: +$('#f-amount').value || 0, month_id: monthId };
+    if (!payload.label) { toast('Add a label'); return; }
+    let error;
+    if (isEdit) ({ error } = await db.from('justine_bills').update(payload).eq('id', b.id));
+    else ({ error } = await db.from('justine_bills').insert(payload));
     if (error) { toast(error.message); return; }
     closeModal(); await loadAll(); renderView();
   };
