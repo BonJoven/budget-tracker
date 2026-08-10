@@ -7,8 +7,10 @@ const { createClient } = supabase;
 const CONFIG_OK = window.SUPABASE_URL && window.SUPABASE_ANON_KEY &&
   !window.SUPABASE_URL.includes('https://obabksylxiioijgnfswu.supabase.co') && !window.SUPABASE_ANON_KEY.includes('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9iYWJrc3lseGlpb2lqZ25mc3d1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYyODM5NjAsImV4cCI6MjEwMTg1OTk2MH0.3UQ4JLCIqI3v-om6JJLrj4isJCr6dcQQBq65zGAi13E');
 let db = null;
+let dbInitError = null;
 if (CONFIG_OK) {
-  try { db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); } catch (e) { db = null; }
+  try { db = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY); }
+  catch (e) { db = null; dbInitError = e.message || String(e); }
 }
 
 const PESO = n => '₱' + Number(n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -45,14 +47,26 @@ function toast(msg) {
 
 async function initAuth() {
   if (!db) {
-    $('#login-screen').innerHTML = `
-      <div class="eyebrow" style="color:var(--red)">Setup needed</div>
-      <h1>config.js isn't filled in</h1>
-      <p style="color:var(--text-dim);max-width:360px;font-size:13px;">
-        Open <code>config.js</code> in your GitHub repo and make sure
-        SUPABASE_URL and SUPABASE_ANON_KEY are your real Supabase values
-        (not the placeholder text), then refresh this page.
-      </p>`;
+    if (!CONFIG_OK) {
+      $('#login-screen').innerHTML = `
+        <div class="eyebrow" style="color:var(--red)">Setup needed</div>
+        <h1>config.js isn't filled in</h1>
+        <p style="color:var(--text-dim);max-width:360px;font-size:13px;">
+          Open <code>config.js</code> in your GitHub repo and make sure
+          SUPABASE_URL and SUPABASE_ANON_KEY are your real Supabase values
+          (not the placeholder text), then refresh this page.
+        </p>`;
+    } else {
+      $('#login-screen').innerHTML = `
+        <div class="eyebrow" style="color:var(--red)">Couldn't start the database client</div>
+        <h1>Something's off with config.js</h1>
+        <p style="color:var(--text-dim);max-width:360px;font-size:13px;">${escapeHtml(dbInitError || 'Unknown error')}</p>
+        <p style="color:var(--text-dim);max-width:360px;font-size:12px;">
+          config.js has values, but creating the connection failed. This is
+          usually a malformed URL. Double-check there's no trailing slash,
+          extra spaces, or stray characters around the URL/key in config.js.
+        </p>`;
+    }
     return;
   }
   try {
