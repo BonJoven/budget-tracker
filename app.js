@@ -155,7 +155,7 @@ async function enterApp() {
 async function loadAll() {
   const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
-    db.from('periods').select('*').order('period_date', { ascending: false }),
+    db.from('periods').select('*').order('period_date', { ascending: true }),
     db.from('transactions').select('*'),
     db.from('installments').select('*'),
     db.from('income_items').select('*'),
