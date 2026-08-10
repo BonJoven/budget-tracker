@@ -247,20 +247,27 @@ function periodIdForDate(dateStr) {
 function scheduleForInstallment(installId) {
   return state.installmentSchedule.filter(s => s.installment_id === installId).sort((a, b) => a.due_date < b.due_date ? -1 : 1);
 }
-// Justine's installments that Joven actually pays through one of his own cards,
-// surfaced as read-only "auto" entries on his Transactions tab for the matching period.
+// Any installment (Joven's own, or Justine's billed onto one of his cards) surfaces
+// automatically as a pinned, read-only "payment plan" row on the matching card +
+// period, sourced live from its schedule - no manual re-entry needed.
 function virtualEntriesForPeriod(periodId) {
   const entries = [];
-  state.installments.filter(i => i.owner === 'justine' && i.billed_to_card_id && !i.archived).forEach(inst => {
+  state.installments.filter(i => !i.archived).forEach(inst => {
+    const billingCardId = inst.owner === 'joven' ? inst.card_id : inst.billed_to_card_id;
+    if (!billingCardId) return; // Justine's own-card installments don't appear on Joven's Transactions tab
+    // For Joven's own installments, the schedule's wifey_share is literally what she owes him.
+    // For Justine's installments billed on his card, the WHOLE amount is her debt (he's just
+    // fronting it via his statement) - that's a separate deduction on her own page, not double-counted here.
     scheduleForInstallment(inst.id).forEach(row => {
       if (periodIdForDate(row.due_date) === periodId) {
         entries.push({
           id: 'virtual-' + row.id,
           description: inst.name,
           amount: Number(row.amount),
-          wifey_share: Number(row.amount), // fully hers - Joven is fronting it
+          wifey_share: inst.owner === 'joven' ? Number(row.wifey_share || 0) : Number(row.amount),
           kind: 'payment_plan',
-          card_id: inst.billed_to_card_id,
+          card_id: billingCardId,
+          installmentId: inst.id,
           virtual: true,
         });
       }
@@ -268,15 +275,21 @@ function virtualEntriesForPeriod(periodId) {
   });
   return entries;
 }
-// Sum of the above for a whole calendar month (both the 15th and 30th periods),
-// used to avoid double-counting on Justine's side.
+// Sum of the above for a whole calendar month (both the 15th and 30th periods) —
+// only counting Justine-owned plans billed to his cards, so this never picks up
+// Joven's own installments (which shouldn't touch her "Joven CC Total" at all).
 function jovenBilledInstallmentsTotalForMonth(monthDate) {
   const mk = monthKey(monthDate);
   const p15 = state.periods.find(p => p.period_type === '15th' && monthKey(p.period_date) === mk);
   const p30 = state.periods.find(p => p.period_type === '30th' && monthKey(p.period_date) === mk);
+  const justineOwned = new Set(state.installments.filter(i => i.owner === 'justine').map(i => i.id));
   let total = 0;
-  if (p15) total += virtualEntriesForPeriod(p15.id).reduce((s, e) => s + e.amount, 0);
-  if (p30) total += virtualEntriesForPeriod(p30.id).reduce((s, e) => s + e.amount, 0);
+  [p15, p30].forEach(p => {
+    if (!p) return;
+    total += virtualEntriesForPeriod(p.id)
+      .filter(e => justineOwned.has(e.installmentId))
+      .reduce((s, e) => s + e.amount, 0);
+  });
   return total;
 }
 
@@ -513,6 +526,21 @@ function renderTransactions() {
       ${(rows.length || virtualRows.length) ? `<table>
         <thead><tr><th>Description</th><th>Type</th><th>Split</th><th class="num">Amount</th><th></th></tr></thead>
         <tbody>
+          ${virtualRows.map(e => {
+            const jShare = e.amount - e.wifey_share;
+            let splitHtml;
+            if (e.wifey_share <= 0) splitHtml = '<span style="color:var(--text-dim);font-size:12px;">All Joven\'s</span>';
+            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Wifey\'s</span>';
+            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Wifey ${PESO(e.wifey_share)}</span></span>`;
+            return `
+            <tr style="background:rgba(227,177,88,.05);">
+              <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From the installment schedule - click to edit this period's split">⇄ payment plan, edit split</button></td>
+              <td><span class="pill payment_plan">Payment plan</span></td>
+              <td>${splitHtml}</td>
+              <td class="num">${PESO(e.amount)}</td>
+              <td></td>
+            </tr>`;
+          }).join('')}
           ${rows.map(t => {
             const wShare = Number(t.wifey_share || 0);
             const jShare = Number(t.amount) - wShare;
@@ -532,18 +560,14 @@ function renderTransactions() {
               </td>
             </tr>`;
           }).join('')}
-          ${virtualRows.map(e => `
-            <tr style="opacity:.8;">
-              <td>${escapeHtml(e.description)} <span class="synced-badge" title="Auto-added from Justine's installment plan - edit it on her Installments tab">⇄ auto</span></td>
-              <td><span class="pill payment_plan">Payment plan</span></td>
-              <td><span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Wifey's</span></td>
-              <td class="num">${PESO(e.amount)}</td>
-              <td></td>
-            </tr>`).join('')}
         </tbody>
       </table>` : `<div class="empty-state">No transactions yet for this card in this period.</div>`}
     `;
     wrap.appendChild(sec);
+  });
+  $$('[data-edit-inst-sched]').forEach(b => b.onclick = () => {
+    const inst = state.installments.find(x => x.id === b.dataset.editInstSched);
+    if (inst) openScheduleModal(inst);
   });
 
   $$('[data-add]').forEach(b => b.onclick = () => openTxnModal(null, b.dataset.add, period.id));
@@ -738,23 +762,26 @@ function openScheduleModal(inst) {
           return `
           <tr style="background:${rowColor};">
             <td>${new Date(r.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })} ${isNext ? '<span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);">next due</span>' : status === 'paid' ? '<span class="synced-badge">paid</span>' : ''}${r.is_fee_row ? ' <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);">+fee</span>' : ''}</td>
-            <td class="num">${PESO(r.amount)}</td>
-            <td class="num"><input type="number" step="0.01" data-row-id="${r.id}" value="${r.wifey_share}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;"></td>
+            <td class="num"><input type="number" step="0.01" data-row-id="${r.id}" data-field="amount" value="${r.amount}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;"></td>
+            <td class="num"><input type="number" step="0.01" data-row-id="${r.id}" data-field="wifey_share" value="${r.wifey_share}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;"></td>
             <td></td>
           </tr>`;
         }).join('')}
       </tbody>
     </table>
     </div>
+    <p style="font-size:11px;color:var(--text-dim);">Amount is editable too - useful for plans where the payment isn't the same every period (like a declining balance).</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Close</button>
       <button class="btn" id="modal-save">Save changes</button>
     </div>
   `);
   $('#modal-save').onclick = async () => {
-    const inputs = $$('#sched-body input[data-row-id]');
-    for (const inp of inputs) {
-      await db.from('installment_schedule').update({ wifey_share: +inp.value || 0 }).eq('id', inp.dataset.rowId);
+    const rowIds = [...new Set($$('#sched-body input[data-row-id]').map(inp => inp.dataset.rowId))];
+    for (const id of rowIds) {
+      const amt = $(`#sched-body input[data-row-id="${id}"][data-field="amount"]`);
+      const wsh = $(`#sched-body input[data-row-id="${id}"][data-field="wifey_share"]`);
+      await db.from('installment_schedule').update({ amount: +amt.value || 0, wifey_share: +wsh.value || 0 }).eq('id', id);
     }
     closeModal(); await loadAll(); renderView();
   };
