@@ -229,13 +229,20 @@ function incomeItemsForPeriod(periodId) {
   return state.incomeItems.filter(i => i.period_id === periodId);
 }
 
+function wifeyTotalForPeriod(periodId) {
+  return state.transactions
+    .filter(t => t.period_id === periodId && t.owner === 'wifey')
+    .reduce((s, t) => s + Number(t.amount), 0);
+}
+
 function periodTotals(period) {
   const cardTotal = state.cards.reduce((s, c) => s + cardTotalForPeriod(c.id, period.id), 0);
+  const wifeyAmount = wifeyTotalForPeriod(period.id);
   const extraIncome = incomeItemsForPeriod(period.id).reduce((s, i) => s + Number(i.amount), 0);
-  const income = Number(period.salary) + Number(period.previous_savings) + Number(period.wifey) + extraIncome;
+  const income = Number(period.salary) + Number(period.previous_savings) + wifeyAmount + extraIncome;
   const outflow = Number(period.accent) + Number(period.spaylater) + cardTotal;
   const savings = income - outflow;
-  return { cardTotal, income, outflow, savings, extraIncome };
+  return { cardTotal, income, outflow, savings, extraIncome, wifeyAmount };
 }
 
 /* ---------------- SUMMARY VIEW ---------------- */
@@ -274,7 +281,7 @@ function renderSummary() {
       </div>
       <div class="line"><span class="lbl">Salary</span><span class="val">${PESO(p.salary)}</span></div>
       <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
-      ${Number(p.wifey) ? `<div class="line"><span class="lbl">Wifey</span><span class="val">${PESO(p.wifey)}</span></div>` : ''}
+      <div class="line"><span class="lbl">Wifey <span class="synced-badge" title="Sum of transactions tagged Wifey across all cards this period">⇄ from transactions</span></span><span class="val">${PESO(t.wifeyAmount)}</span></div>
       ${incomeItemsForPeriod(p.id).map(item => `
         <div class="line">
           <span class="lbl">${escapeHtml(item.label)}
@@ -358,12 +365,10 @@ function openPeriodModal(period) {
       <div class="field"><label>Previous savings</label><input type="number" step="0.01" id="f-prev" value="${p.previous_savings}"></div>
     </div>
     <div class="field-row">
-      <div class="field"><label>Wifey</label><input type="number" step="0.01" id="f-wifey" value="${p.wifey}"></div>
       <div class="field"><label>Spaylater</label><input type="number" step="0.01" id="f-spay" value="${p.spaylater}"></div>
-    </div>
-    <div class="field-row">
       <div class="field"><label>Accent (car amort)</label><input type="number" step="0.01" id="f-accent" value="${p.accent}"></div>
     </div>
+    <p style="font-size:12px;color:var(--text-dim);">Wifey isn't entered here anymore — tag her transactions as "Wifey's" on the Transactions tab and it totals up automatically.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -375,7 +380,6 @@ function openPeriodModal(period) {
       period_type: $('#f-type').value,
       salary: +$('#f-salary').value || 0,
       previous_savings: +$('#f-prev').value || 0,
-      wifey: +$('#f-wifey').value || 0,
       spaylater: +$('#f-spay').value || 0,
       accent: +$('#f-accent').value || 0,
     };
@@ -434,12 +438,13 @@ function renderTransactions() {
         </div>
       </div>
       ${rows.length ? `<table>
-        <thead><tr><th>Description</th><th>Type</th><th class="num">Amount</th><th></th></tr></thead>
+        <thead><tr><th>Description</th><th>Type</th><th>Whose</th><th class="num">Amount</th><th></th></tr></thead>
         <tbody>
           ${rows.map(t => `
             <tr>
               <td>${escapeHtml(t.description)}</td>
               <td><span class="pill ${t.kind}">${t.kind === 'bill' ? 'Bill' : 'Payment plan'}</span></td>
+              <td>${t.owner === 'wifey' ? '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">Wifey</span>' : '<span style="color:var(--text-dim);font-size:12px;">Joven</span>'}</td>
               <td class="num">${PESO(t.amount)}</td>
               <td style="text-align:right;white-space:nowrap;">
                 <button class="icon-btn edit" data-edit-txn="${t.id}">✎</button>
@@ -466,7 +471,7 @@ function renderTransactions() {
 
 function openTxnModal(txn, cardId, periodId) {
   const isEdit = !!txn;
-  const t = txn || { description: '', amount: '', kind: 'bill' };
+  const t = txn || { description: '', amount: '', kind: 'bill', owner: 'joven' };
   showModal(`
     <h3>${isEdit ? 'Edit' : 'Add'} transaction</h3>
     <div class="field-row">
@@ -481,6 +486,14 @@ function openTxnModal(txn, cardId, periodId) {
         </select>
       </div>
     </div>
+    <div class="field-row">
+      <div class="field"><label>Whose spending</label>
+        <select id="f-owner">
+          <option value="joven" ${t.owner === 'joven' ? 'selected' : ''}>Joven's</option>
+          <option value="wifey" ${t.owner === 'wifey' ? 'selected' : ''}>Wifey's (adds to her total, owed back to you)</option>
+        </select>
+      </div>
+    </div>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -491,6 +504,7 @@ function openTxnModal(txn, cardId, periodId) {
       description: $('#f-desc').value.trim(),
       amount: +$('#f-amt').value || 0,
       kind: $('#f-kind').value,
+      owner: $('#f-owner').value,
       card_id: cardId,
       period_id: periodId,
     };
