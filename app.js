@@ -231,8 +231,8 @@ function incomeItemsForPeriod(periodId) {
 
 function wifeyTotalForPeriod(periodId) {
   return state.transactions
-    .filter(t => t.period_id === periodId && t.owner === 'wifey')
-    .reduce((s, t) => s + Number(t.amount), 0);
+    .filter(t => t.period_id === periodId)
+    .reduce((s, t) => s + Number(t.wifey_share || 0), 0);
 }
 
 function periodTotals(period) {
@@ -438,19 +438,27 @@ function renderTransactions() {
         </div>
       </div>
       ${rows.length ? `<table>
-        <thead><tr><th>Description</th><th>Type</th><th>Whose</th><th class="num">Amount</th><th></th></tr></thead>
+        <thead><tr><th>Description</th><th>Type</th><th>Split</th><th class="num">Amount</th><th></th></tr></thead>
         <tbody>
-          ${rows.map(t => `
+          ${rows.map(t => {
+            const wShare = Number(t.wifey_share || 0);
+            const jShare = Number(t.amount) - wShare;
+            let splitHtml;
+            if (wShare <= 0) splitHtml = '<span style="color:var(--text-dim);font-size:12px;">All Joven\'s</span>';
+            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Wifey\'s</span>';
+            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Wifey ${PESO(wShare)}</span></span>`;
+            return `
             <tr>
               <td>${escapeHtml(t.description)}</td>
               <td><span class="pill ${t.kind}">${t.kind === 'bill' ? 'Bill' : 'Payment plan'}</span></td>
-              <td>${t.owner === 'wifey' ? '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">Wifey</span>' : '<span style="color:var(--text-dim);font-size:12px;">Joven</span>'}</td>
+              <td>${splitHtml}</td>
               <td class="num">${PESO(t.amount)}</td>
               <td style="text-align:right;white-space:nowrap;">
                 <button class="icon-btn edit" data-edit-txn="${t.id}">✎</button>
                 <button class="icon-btn" data-del-txn="${t.id}">✕</button>
               </td>
-            </tr>`).join('')}
+            </tr>`;
+          }).join('')}
         </tbody>
       </table>` : `<div class="empty-state">No transactions yet for this card in this period.</div>`}
     `;
@@ -471,7 +479,7 @@ function renderTransactions() {
 
 function openTxnModal(txn, cardId, periodId) {
   const isEdit = !!txn;
-  const t = txn || { description: '', amount: '', kind: 'bill', owner: 'joven' };
+  const t = txn || { description: '', amount: '', kind: 'bill', wifey_share: 0 };
   showModal(`
     <h3>${isEdit ? 'Edit' : 'Add'} transaction</h3>
     <div class="field-row">
@@ -486,25 +494,41 @@ function openTxnModal(txn, cardId, periodId) {
         </select>
       </div>
     </div>
+    <div class="field-row" style="align-items:center;gap:6px;">
+      <button type="button" class="btn secondary" id="split-all-mine" style="padding:6px 10px;font-size:12px;">All mine</button>
+      <button type="button" class="btn secondary" id="split-half" style="padding:6px 10px;font-size:12px;">Split 50/50</button>
+      <button type="button" class="btn secondary" id="split-all-hers" style="padding:6px 10px;font-size:12px;">All hers</button>
+    </div>
     <div class="field-row">
-      <div class="field"><label>Whose spending</label>
-        <select id="f-owner">
-          <option value="joven" ${t.owner === 'joven' ? 'selected' : ''}>Joven's</option>
-          <option value="wifey" ${t.owner === 'wifey' ? 'selected' : ''}>Wifey's (adds to her total, owed back to you)</option>
-        </select>
-      </div>
+      <div class="field"><label>Wifey's share (₱)</label><input type="number" step="0.01" id="f-wshare" value="${t.wifey_share || 0}"></div>
+      <div class="field"><label>Your share (auto)</label><input type="text" id="f-jshare" value="" disabled style="opacity:.7;"></div>
     </div>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
     </div>
   `);
+  const updateJShare = () => {
+    const amt = +$('#f-amt').value || 0;
+    const w = +$('#f-wshare').value || 0;
+    $('#f-jshare').value = PESO(amt - w);
+  };
+  $('#f-amt').oninput = updateJShare;
+  $('#f-wshare').oninput = updateJShare;
+  $('#split-all-mine').onclick = () => { $('#f-wshare').value = 0; updateJShare(); };
+  $('#split-half').onclick = () => { $('#f-wshare').value = (( +$('#f-amt').value || 0) / 2).toFixed(2); updateJShare(); };
+  $('#split-all-hers').onclick = () => { $('#f-wshare').value = (+$('#f-amt').value || 0).toFixed(2); updateJShare(); };
+  updateJShare();
+
   $('#modal-save').onclick = async () => {
+    const amount = +$('#f-amt').value || 0;
+    const wifeyShare = +$('#f-wshare').value || 0;
+    if (wifeyShare < 0 || wifeyShare > amount) { toast("Wifey's share can't be negative or more than the total amount"); return; }
     const payload = {
       description: $('#f-desc').value.trim(),
-      amount: +$('#f-amt').value || 0,
+      amount,
       kind: $('#f-kind').value,
-      owner: $('#f-owner').value,
+      wifey_share: wifeyShare,
       card_id: cardId,
       period_id: periodId,
     };
