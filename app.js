@@ -293,6 +293,13 @@ function jovenBilledInstallmentsTotalForMonth(monthDate) {
   return total;
 }
 
+function toLocalISODate(d) {
+  // Avoids the classic toISOString() UTC-shift bug that pushes dates back a
+  // day for timezones ahead of UTC (like the Philippines).
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 function generateScheduleRows(inst) {
   const rows = [];
   const start = new Date(inst.start_date + 'T00:00:00');
@@ -300,7 +307,7 @@ function generateScheduleRows(inst) {
     const d = new Date(start);
     d.setMonth(d.getMonth() + i);
     rows.push({
-      due_date: d.toISOString().slice(0, 10),
+      due_date: toLocalISODate(d),
       amount: Number(inst.monthly_amount) + (i === 0 ? Number(inst.fee || 0) : 0),
       wifey_share: Number(inst.wifey_monthly_share || 0) + (i === 0 ? Number(inst.wifey_fee_share || 0) : 0),
     });
@@ -849,6 +856,12 @@ function openInstallModal(item) {
     };
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
     let error, savedId = i.id;
+    const scheduleAffectingFieldsChanged = isEdit && (
+      Number(payload.monthly_amount) !== Number(i.monthly_amount) ||
+      Number(payload.num_months) !== Number(i.num_months) ||
+      payload.start_date !== i.start_date ||
+      Number(payload.fee) !== Number(i.fee || 0)
+    );
     if (isEdit) {
       ({ error } = await db.from('installments').update(payload).eq('id', i.id));
     } else {
@@ -856,7 +869,13 @@ function openInstallModal(item) {
       error = res.error; savedId = res.data ? res.data.id : null;
     }
     if (error) { toast(error.message); return; }
-    if (savedId) await regenerateSchedule({ ...payload, id: savedId });
+    // Only wipe/regenerate the schedule on a brand-new installment, or when a
+    // field that actually changes the schedule's shape was edited. Editing
+    // unrelated fields (name, payer, billed-to-card) leaves your per-period
+    // edits in "View schedule" untouched.
+    if (savedId && (!isEdit || scheduleAffectingFieldsChanged)) {
+      await regenerateSchedule({ ...payload, id: savedId });
+    }
     closeModal(); await loadAll(); renderView();
   };
 }
