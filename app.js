@@ -205,7 +205,7 @@ function renderSidebar() {
     renderSidebar();
     renderView();
   });
-  $$('.nav-btn').forEach(b => b.onclick = () => { state.view = b.dataset.view; renderView(); });
+  $$('.nav-btn').forEach(b => b.onclick = () => { state.view = b.dataset.view; renderView(); closeMobileSidebar(); });
   $('#logout-btn').onclick = logout;
 }
 
