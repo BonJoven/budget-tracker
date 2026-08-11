@@ -1169,5 +1169,21 @@ function closeModal() { $('#modal-backdrop').classList.remove('active'); }
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 /* ---------------- INIT ---------------- */
-grep -n "document.addEventListener('DOMContentLoaded', initAuth);" /home/claude/budget-app/app.js
+/* ---------- Mobile drawer ---------- */
+function closeMobileSidebar() {
+  const sb = document.getElementById('sidebar');
+  const bd = document.getElementById('sidebar-backdrop');
+  if (sb) sb.classList.remove('open');
+  if (bd) bd.classList.remove('open');
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('mobile-menu-btn');
+  const backdrop = document.getElementById('sidebar-backdrop');
+  if (btn) btn.onclick = () => {
+    document.getElementById('sidebar').classList.toggle('open');
+    backdrop.classList.toggle('open');
+  };
+  if (backdrop) backdrop.onclick = closeMobileSidebar;
+});
+
 document.addEventListener('DOMContentLoaded', initAuth);
