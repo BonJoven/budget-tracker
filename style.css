@@ -305,7 +305,7 @@ tr:hover td{background:var(--surface2);}
   font-size:10px;color:var(--blue);background:rgba(91,157,249,.12);
   padding:1px 7px;border-radius:99px;margin-left:6px;font-weight:700;
 }
-cat >> /home/claude/budget-app/style.css << 'EOF'
+
 
 /* ---------- Mobile layout ---------- */
 #mobile-menu-btn{display:none;}
@@ -335,5 +335,3 @@ cat >> /home/claude/budget-app/style.css << 'EOF'
   table{font-size:12px;}
   th,td{padding:7px 6px;}
 }
-EOF
-echo "appended"
