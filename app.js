@@ -191,7 +191,7 @@ function renderSidebar() {
     <button class="nav-btn" data-view="installments">Installments</button>
   `;
   $('#sidebar').innerHTML = `
-    <div class="brand"><span class="dot"></span> BENTINE</div>
+    <div class="brand"><span class="dot"></span> Household Budget</div>
     <div class="profile-switch" id="profile-switch">
       <button data-profile="joven" class="${state.profile === 'joven' ? 'active' : ''}"><span class="avatar">J</span>Joven</button>
       <button data-profile="justine" class="${state.profile === 'justine' ? 'active' : ''}"><span class="avatar">J</span>Justine</button>
@@ -250,6 +250,18 @@ function periodIdForDate(dateStr) {
 function scheduleForInstallment(installId) {
   return state.installmentSchedule.filter(s => s.installment_id === installId).sort((a, b) => a.due_date < b.due_date ? -1 : 1);
 }
+// Always adds the fee (and its share) on top of the row's base amount when
+// this is the fee row - computed fresh every time, so it can never go stale
+// even if the fee is edited without a full schedule regeneration. The base
+// `row.amount` / `row.wifey_share` stay directly editable in "View schedule"
+// for plans where the payment isn't the same every period.
+function totalAmountForRow(inst, row) {
+  return Number(row.amount) + (row.is_fee_row ? Number(inst.fee || 0) : 0);
+}
+function totalWifeyShareForRow(inst, row) {
+  return Number(row.wifey_share || 0) + (row.is_fee_row ? Number(inst.wifey_fee_share || 0) : 0);
+}
+
 // Joven's own installments surface automatically as a pinned, read-only
 // "payment plan" row on the matching card + period, sourced live from the
 // schedule - no manual re-entry needed. (Justine's installments are kept
@@ -262,10 +274,33 @@ function virtualEntriesForPeriod(periodId) {
         entries.push({
           id: 'virtual-' + row.id,
           description: inst.name,
-          amount: Number(row.amount),
-          wifey_share: Number(row.wifey_share || 0),
+          amount: totalAmountForRow(inst, row),
+          wifey_share: totalWifeyShareForRow(inst, row),
           kind: 'payment_plan',
           card_id: inst.card_id,
+          installmentId: inst.id,
+          virtual: true,
+        });
+      }
+    });
+  });
+  return entries;
+}
+
+// Justine-owned installments where Joven covers some/all of a period's
+// payment ("Joven's share" on her schedule) pin automatically into HIS
+// General Ledger - not tied to any card - as a negative entry, since he's
+// the one paying that amount (it reduces what she owes him overall).
+function justineSharedLedgerEntriesForPeriod(periodId) {
+  const entries = [];
+  state.installments.filter(i => !i.archived && i.owner === 'justine').forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      const share = totalWifeyShareForRow(inst, row);
+      if (periodIdForDate(row.due_date) === periodId && share > 0) {
+        entries.push({
+          id: 'ledger-virtual-' + row.id,
+          description: inst.name,
+          amount: -share,
           installmentId: inst.id,
           virtual: true,
         });
@@ -290,8 +325,8 @@ function generateScheduleRows(inst) {
     d.setMonth(d.getMonth() + i);
     rows.push({
       due_date: toLocalISODate(d),
-      amount: Number(inst.monthly_amount) + (i === 0 ? Number(inst.fee || 0) : 0),
-      wifey_share: Number(inst.wifey_monthly_share || 0) + (i === 0 ? Number(inst.wifey_fee_share || 0) : 0),
+      amount: Number(inst.monthly_amount),          // base amount only - fee is added on top at display time
+      wifey_share: Number(inst.wifey_monthly_share || 0),  // base share only - fee share added on top at display time
     });
   }
   return rows;
@@ -309,7 +344,8 @@ function wifeyTotalForPeriod(periodId) {
   const adjustments = state.wifeyAdjustments
     .filter(a => a.period_id === periodId)
     .reduce((s, a) => s + Number(a.amount), 0);
-  return real + virtual + adjustments;
+  const sharedLedger = justineSharedLedgerEntriesForPeriod(periodId).reduce((s, e) => s + e.amount, 0);
+  return real + virtual + adjustments + sharedLedger;
 }
 
 function periodTotals(period) {
@@ -508,12 +544,19 @@ function renderTransactions() {
   $('#period-select').onchange = e => { state.txnPeriodId = e.target.value; renderTransactions(); };
 
   const adjustments = state.wifeyAdjustments.filter(a => a.period_id === period.id);
-  const adjTotal = adjustments.reduce((s, a) => s + Number(a.amount), 0);
-  $('#general-ledger-total').textContent = (adjTotal >= 0 ? '+' : '') + PESO(adjTotal).replace('₱-', '-₱');
+  const sharedEntries = justineSharedLedgerEntriesForPeriod(period.id);
+  const ledgerTotal = adjustments.reduce((s, a) => s + Number(a.amount), 0) + sharedEntries.reduce((s, e) => s + e.amount, 0);
+  $('#general-ledger-total').textContent = (ledgerTotal >= 0 ? '+' : '-') + PESO(Math.abs(ledgerTotal));
   const ledgerRows = $('#general-ledger-rows');
-  ledgerRows.innerHTML = adjustments.length ? `<table>
+  ledgerRows.innerHTML = (sharedEntries.length || adjustments.length) ? `<table>
       <thead><tr><th>Description</th><th class="num">Amount</th><th></th></tr></thead>
       <tbody>
+        ${sharedEntries.map(e => `
+          <tr>
+            <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From Justine's installment schedule - Joven's share on this plan. Click to edit.">⇄ payment plan, edit split</button></td>
+            <td class="num" style="color:var(--green);">-${PESO(Math.abs(e.amount))}</td>
+            <td></td>
+          </tr>`).join('')}
         ${adjustments.map(a => `
           <tr>
             <td>${escapeHtml(a.description)}</td>
@@ -534,6 +577,10 @@ function renderTransactions() {
     if (!confirm('Delete this entry?')) return;
     await db.from('wifey_adjustments').delete().eq('id', b.dataset.delAdj);
     await loadAll(); renderView();
+  });
+  $$('#general-ledger-rows [data-edit-inst-sched]').forEach(b => b.onclick = () => {
+    const inst = state.installments.find(x => x.id === b.dataset.editInstSched);
+    openScheduleModal(inst);
   });
 
   const wrap = $('#card-sections');
@@ -750,7 +797,7 @@ function renderInstallments() {
     const done = schedule.length > 0 && paidCount >= schedule.length;
     const nextId = nextDueRowId(schedule);
     const lastRow = schedule[schedule.length - 1];
-    const totalToPay = schedule.reduce((s, r) => s + Number(r.amount), 0);
+    const totalToPay = schedule.reduce((s, r) => s + totalAmountForRow(i, r), 0);
     const principal = Number(i.principal) || 0;
     const interest = Math.max(totalToPay - principal, 0);
     const interestPct = totalToPay > 0 ? Math.round((interest / totalToPay) * 100) : 0;
@@ -822,8 +869,14 @@ function openScheduleModal(inst) {
           return `
           <tr style="background:${rowColor};">
             <td>${new Date(r.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })} ${isNext ? '<span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);">next due</span>' : status === 'paid' ? '<span class="synced-badge">paid</span>' : ''}${r.is_fee_row && Number(inst.fee) > 0 ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);">+₱${Number(inst.fee).toFixed(2)} fee</span>` : ''}</td>
-            <td class="num"><input type="number" step="0.01" data-row-id="${r.id}" data-field="amount" value="${r.amount}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;"></td>
-            <td class="num"><input type="number" step="0.01" data-row-id="${r.id}" data-field="wifey_share" value="${r.wifey_share}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;"></td>
+            <td class="num">
+              <input type="number" step="0.01" data-row-id="${r.id}" data-field="amount" value="${r.amount}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;">
+              ${r.is_fee_row && Number(inst.fee) > 0 ? `<div style="font-size:10px;color:var(--text-dim);margin-top:3px;">= ${PESO(totalAmountForRow(inst, r))} total w/ fee</div>` : ''}
+            </td>
+            <td class="num">
+              <input type="number" step="0.01" data-row-id="${r.id}" data-field="wifey_share" value="${r.wifey_share}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;">
+              ${r.is_fee_row && Number(inst.wifey_fee_share) > 0 ? `<div style="font-size:10px;color:var(--text-dim);margin-top:3px;">= ${PESO(totalWifeyShareForRow(inst, r))} total w/ fee</div>` : ''}
+            </td>
             <td></td>
           </tr>`;
         }).join('')}
