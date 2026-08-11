@@ -405,7 +405,7 @@ function renderSummary() {
   const periods = state.periods;
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Summary</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
+      <div><h2>Joven</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
       <button class="btn" id="add-period-btn">+ New period</button>
     </div>
     <div class="period-grid" id="period-grid"></div>
@@ -1154,7 +1154,7 @@ function renderJustineSummary() {
   const main = $('#main');
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Justine's Budget</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
+      <div><h2>Justine</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
       <button class="btn" id="add-month-btn">+ New month</button>
     </div>
     <div class="period-grid" id="month-grid"></div>
