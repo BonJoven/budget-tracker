@@ -191,7 +191,7 @@ function renderSidebar() {
     <button class="nav-btn" data-view="installments">Installments</button>
   `;
   $('#sidebar').innerHTML = `
-    <div class="brand"><span class="dot"></span> Household Budget</div>
+    <div class="brand"><span class="dot"></span> BENTINE</div>
     <div class="profile-switch" id="profile-switch">
       <button data-profile="joven" class="${state.profile === 'joven' ? 'active' : ''}"><span class="avatar">J</span>Joven</button>
       <button data-profile="justine" class="${state.profile === 'justine' ? 'active' : ''}"><span class="avatar">J</span>Justine</button>
