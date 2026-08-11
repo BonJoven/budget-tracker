@@ -26,6 +26,7 @@ let state = {
   incomeItems: [],
   justineMonths: [],
   justineBills: [],
+  wifeyAdjustments: [],
   profile: 'joven',       // 'joven' or 'justine'
   view: 'summary',
   txnPeriodId: null,
@@ -154,7 +155,7 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: true }),
     db.from('transactions').select('*'),
@@ -163,6 +164,7 @@ async function loadAll() {
     db.from('justine_months').select('*').order('month_date', { ascending: false }),
     db.from('justine_bills').select('*'),
     db.from('installment_schedule').select('*').order('due_date', { ascending: true }),
+    db.from('wifey_adjustments').select('*'),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
@@ -172,6 +174,7 @@ async function loadAll() {
   state.justineMonths = justineMonths.data || [];
   state.justineBills = justineBills.data || [];
   state.installmentSchedule = schedule.data || [];
+  state.wifeyAdjustments = wifeyAdjustments.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
@@ -247,26 +250,22 @@ function periodIdForDate(dateStr) {
 function scheduleForInstallment(installId) {
   return state.installmentSchedule.filter(s => s.installment_id === installId).sort((a, b) => a.due_date < b.due_date ? -1 : 1);
 }
-// Any installment (Joven's own, or Justine's billed onto one of his cards) surfaces
-// automatically as a pinned, read-only "payment plan" row on the matching card +
-// period, sourced live from its schedule - no manual re-entry needed.
+// Joven's own installments surface automatically as a pinned, read-only
+// "payment plan" row on the matching card + period, sourced live from the
+// schedule - no manual re-entry needed. (Justine's installments are kept
+// fully separate from his tracker - see her tab.)
 function virtualEntriesForPeriod(periodId) {
   const entries = [];
-  state.installments.filter(i => !i.archived).forEach(inst => {
-    const billingCardId = inst.owner === 'joven' ? inst.card_id : inst.billed_to_card_id;
-    if (!billingCardId) return; // Justine's own-card installments don't appear on Joven's Transactions tab
-    // For Joven's own installments, the schedule's wifey_share is literally what she owes him.
-    // For Justine's installments billed on his card, the WHOLE amount is her debt (he's just
-    // fronting it via his statement) - that's a separate deduction on her own page, not double-counted here.
+  state.installments.filter(i => !i.archived && i.owner === 'joven').forEach(inst => {
     scheduleForInstallment(inst.id).forEach(row => {
       if (periodIdForDate(row.due_date) === periodId) {
         entries.push({
           id: 'virtual-' + row.id,
           description: inst.name,
           amount: Number(row.amount),
-          wifey_share: inst.owner === 'joven' ? Number(row.wifey_share || 0) : Number(row.amount),
+          wifey_share: Number(row.wifey_share || 0),
           kind: 'payment_plan',
-          card_id: billingCardId,
+          card_id: inst.card_id,
           installmentId: inst.id,
           virtual: true,
         });
@@ -274,23 +273,6 @@ function virtualEntriesForPeriod(periodId) {
     });
   });
   return entries;
-}
-// Sum of the above for a whole calendar month (both the 15th and 30th periods) —
-// only counting Justine-owned plans billed to his cards, so this never picks up
-// Joven's own installments (which shouldn't touch her "Joven CC Total" at all).
-function jovenBilledInstallmentsTotalForMonth(monthDate) {
-  const mk = monthKey(monthDate);
-  const p15 = state.periods.find(p => p.period_type === '15th' && monthKey(p.period_date) === mk);
-  const p30 = state.periods.find(p => p.period_type === '30th' && monthKey(p.period_date) === mk);
-  const justineOwned = new Set(state.installments.filter(i => i.owner === 'justine').map(i => i.id));
-  let total = 0;
-  [p15, p30].forEach(p => {
-    if (!p) return;
-    total += virtualEntriesForPeriod(p.id)
-      .filter(e => justineOwned.has(e.installmentId))
-      .reduce((s, e) => s + e.amount, 0);
-  });
-  return total;
 }
 
 function toLocalISODate(d) {
@@ -324,7 +306,10 @@ function wifeyTotalForPeriod(periodId) {
     .filter(t => t.period_id === periodId)
     .reduce((s, t) => s + Number(t.wifey_share || 0), 0);
   const virtual = virtualEntriesForPeriod(periodId).reduce((s, e) => s + e.wifey_share, 0);
-  return real + virtual;
+  const adjustments = state.wifeyAdjustments
+    .filter(a => a.period_id === periodId)
+    .reduce((s, a) => s + Number(a.amount), 0);
+  return real + virtual + adjustments;
 }
 
 function periodTotals(period) {
@@ -508,8 +493,48 @@ function renderTransactions() {
       </div>
     </div>
     <div id="card-sections"></div>
+    <div class="section-card" id="general-ledger-section">
+      <div class="sh">
+        <h3>General ledger <span class="synced-badge" title="Not tied to any card - cash lent, cash paid, or any manual adjustment to what she owes you">not card-specific</span></h3>
+        <div style="display:flex;align-items:center;gap:14px;">
+          <span class="total" id="general-ledger-total"></span>
+          <button class="btn secondary" id="add-adjustment-btn" style="padding:6px 12px;font-size:13px;">+ Add</button>
+        </div>
+      </div>
+      <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">e.g. cash you lent her (positive, adds to what she owes) or cash/expenses you covered for her outside a card (negative, reduces it).</p>
+      <div id="general-ledger-rows"></div>
+    </div>
   `;
   $('#period-select').onchange = e => { state.txnPeriodId = e.target.value; renderTransactions(); };
+
+  const adjustments = state.wifeyAdjustments.filter(a => a.period_id === period.id);
+  const adjTotal = adjustments.reduce((s, a) => s + Number(a.amount), 0);
+  $('#general-ledger-total').textContent = (adjTotal >= 0 ? '+' : '') + PESO(adjTotal).replace('₱-', '-₱');
+  const ledgerRows = $('#general-ledger-rows');
+  ledgerRows.innerHTML = adjustments.length ? `<table>
+      <thead><tr><th>Description</th><th class="num">Amount</th><th></th></tr></thead>
+      <tbody>
+        ${adjustments.map(a => `
+          <tr>
+            <td>${escapeHtml(a.description)}</td>
+            <td class="num" style="color:${Number(a.amount) < 0 ? 'var(--green)' : 'var(--text)'};">${Number(a.amount) >= 0 ? '+' : '-'}${PESO(Math.abs(a.amount))}</td>
+            <td style="text-align:right;white-space:nowrap;">
+              <button class="icon-btn edit" data-edit-adj="${a.id}">✎</button>
+              <button class="icon-btn" data-del-adj="${a.id}">✕</button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : `<div class="empty-state">Nothing here yet.</div>`;
+  $('#add-adjustment-btn').onclick = () => openAdjustmentModal(null, period.id);
+  $$('[data-edit-adj]').forEach(b => b.onclick = () => {
+    const a = state.wifeyAdjustments.find(x => x.id === b.dataset.editAdj);
+    openAdjustmentModal(a, a.period_id);
+  });
+  $$('[data-del-adj]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this entry?')) return;
+    await db.from('wifey_adjustments').delete().eq('id', b.dataset.delAdj);
+    await loadAll(); renderView();
+  });
 
   const wrap = $('#card-sections');
   if (!state.cards.length) {
@@ -587,6 +612,34 @@ function renderTransactions() {
     await db.from('transactions').delete().eq('id', b.dataset.delTxn);
     await loadAll(); renderView();
   });
+}
+
+function openAdjustmentModal(adj, periodId) {
+  const isEdit = !!adj;
+  const a = adj || { description: '', amount: '' };
+  showModal(`
+    <h3>${isEdit ? 'Edit' : 'Add'} general ledger entry</h3>
+    <div class="field-row">
+      <div class="field"><label>Description</label><input type="text" id="f-desc" value="${a.description ? escapeHtml(a.description) : ''}" placeholder="e.g. Lent her cash for groceries"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Amount</label><input type="number" step="0.01" id="f-amt" value="${a.amount}" placeholder="positive = she owes you more"></div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);">Positive amount = adds to what she owes you (e.g. cash you lent her). Negative amount = reduces it (e.g. you covered something for her). Type a minus sign for negative, like -500.</p>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-save">Save</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const payload = { description: $('#f-desc').value.trim(), amount: +$('#f-amt').value || 0, period_id: periodId };
+    if (!payload.description) { toast('Add a description'); return; }
+    let error;
+    if (isEdit) ({ error } = await db.from('wifey_adjustments').update(payload).eq('id', a.id));
+    else ({ error } = await db.from('wifey_adjustments').insert(payload));
+    if (error) { toast(error.message); return; }
+    closeModal(); await loadAll(); renderView();
+  };
 }
 
 function openTxnModal(txn, cardId, periodId) {
@@ -823,17 +876,6 @@ function openInstallModal(item) {
       <div class="field"><label>Start date</label><input type="date" id="f-start" value="${i.start_date}"></div>
       <div class="field"><label>Payer / note</label><input type="text" id="f-payer" value="${i.payer ? escapeHtml(i.payer) : ''}" placeholder="e.g. Justine"></div>
     </div>
-    ${state.profile === 'justine' ? `
-    <div class="field-row">
-      <div class="field"><label>Actually billed on Joven's card?</label>
-        <select id="f-billed">
-          <option value="">No — billed on her own card above</option>
-          ${state.cards.map(c => `<option value="${c.id}" ${i.billed_to_card_id === c.id ? 'selected' : ''}>${c.name} (his)</option>`).join('')}
-        </select>
-      </div>
-    </div>
-    <p style="font-size:12px;color:var(--text-dim);">If set, this shows up automatically on Joven's Transactions tab and reduces her "Joven CC Total" each period — no manual re-entry.</p>
-    ` : ''}
     ${isEdit ? `<p style="font-size:12px;color:var(--text-dim);">Changing amount/months/start date regenerates the schedule and resets any per-period edits you made in "View schedule".</p>` : ''}
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
@@ -852,7 +894,6 @@ function openInstallModal(item) {
       num_months: +$('#f-months').value || 1,
       start_date: $('#f-start').value,
       payer: $('#f-payer').value.trim(),
-      billed_to_card_id: state.profile === 'justine' ? ($('#f-billed').value || null) : null,
     };
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
     let error, savedId = i.id;
@@ -977,12 +1018,10 @@ function justineBillsForMonth(monthId) {
 function justineTotals(m) {
   const { kuya15, kuya30 } = jovenAccentForMonth(m.month_date);
   const billsTotal = justineBillsForMonth(m.id).reduce((s, b) => s + Number(b.amount), 0);
-  const billedByJoven = jovenBilledInstallmentsTotalForMonth(m.month_date);
-  const jovenCcNet = Math.max(Number(m.joven_cc_total) - billedByJoven, 0);
   const payablesTotal = Number(m.bpi_total) + Number(m.eastwest_total) + billsTotal + kuya15 + kuya30;
-  const totalOutflow = jovenCcNet + payablesTotal;
+  const totalOutflow = Number(m.joven_cc_total) + payablesTotal;
   const savings = Number(m.paycheck_budget) - totalOutflow;
-  return { kuya15, kuya30, billsTotal, payablesTotal, totalOutflow, savings, billedByJoven, jovenCcNet };
+  return { kuya15, kuya30, billsTotal, payablesTotal, totalOutflow, savings };
 }
 
 function renderJustineSummary() {
@@ -1015,11 +1054,8 @@ function renderJustineSummary() {
           <button class="icon-btn" data-del-m="${m.id}" title="Delete">✕</button>
         </div>
       </div>
-      <div class="line"><span class="lbl">15th Paycheck Budget</span><span class="val">${PESO(m.paycheck_budget)}</span></div>
-      <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(m.previous_savings)}</span></div>
+      <div class="line"><span class="lbl">💰</span><span class="val">${PESO(m.paycheck_budget)}</span></div>
       <div class="line"><span class="lbl">Joven CC Total</span><span class="val">${PESO(m.joven_cc_total)}</span></div>
-      ${t.billedByJoven > 0 ? `<div class="line"><span class="lbl" style="padding-left:12px;color:var(--green);">− billed directly to his cards <span class="synced-badge" title="Auto-subtracted: these installments are hers but Joven pays them via his own card, so she doesn't owe him separately for them">⇄ auto</span></span><span class="val" style="color:var(--green);">−${PESO(t.billedByJoven)}</span></div>
-      <div class="line"><span class="lbl" style="padding-left:12px;">= net owed to Joven</span><span class="val">${PESO(t.jovenCcNet)}</span></div>` : ''}
       <div class="line"><span class="lbl">BPI</span><span class="val">${PESO(m.bpi_total)}</span></div>
       <div class="line"><span class="lbl">Eastwest</span><span class="val">${PESO(m.eastwest_total)}</span></div>
       ${justineBillsForMonth(m.id).map(b => `
@@ -1059,24 +1095,21 @@ function renderJustineSummary() {
 
 function openJustineMonthModal(month) {
   const isEdit = !!month;
-  const m = month || { month_date: '', paycheck_budget: 0, previous_savings: 0, joven_cc_total: 0, bpi_total: 0, eastwest_total: 0 };
+  const m = month || { month_date: '', paycheck_budget: 0, joven_cc_total: 0, bpi_total: 0, eastwest_total: 0 };
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} month</h3>
     <div class="field-row">
       <div class="field"><label>Month</label><input type="month" id="f-month" value="${m.month_date ? m.month_date.slice(0, 7) : ''}"></div>
     </div>
     <div class="field-row">
-      <div class="field"><label>15th Paycheck Budget</label><input type="number" step="0.01" id="f-budget" value="${m.paycheck_budget}"></div>
-      <div class="field"><label>Previous savings</label><input type="number" step="0.01" id="f-prev" value="${m.previous_savings}"></div>
-    </div>
-    <div class="field-row">
+      <div class="field"><label>💰 Paycheck Budget</label><input type="number" step="0.01" id="f-budget" value="${m.paycheck_budget}"></div>
       <div class="field"><label>Joven CC Total</label><input type="number" step="0.01" id="f-joven" value="${m.joven_cc_total}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>BPI</label><input type="number" step="0.01" id="f-bpi" value="${m.bpi_total}"></div>
       <div class="field"><label>Eastwest</label><input type="number" step="0.01" id="f-ew" value="${m.eastwest_total}"></div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);">Kuya Edrian 15/30 aren't entered here — they're pulled automatically from Joven's Accent on his 15th/30th periods for this same month.</p>
+    <p style="font-size:12px;color:var(--text-dim);">Kuya Edrian 15/30 aren't entered here — they're pulled automatically from Joven's Accent on his 15th/30th periods for this same month. Savings = 💰 minus everything above and the bills below.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -1088,7 +1121,6 @@ function openJustineMonthModal(month) {
     const payload = {
       month_date: monthVal + '-01',
       paycheck_budget: +$('#f-budget').value || 0,
-      previous_savings: +$('#f-prev').value || 0,
       joven_cc_total: +$('#f-joven').value || 0,
       bpi_total: +$('#f-bpi').value || 0,
       eastwest_total: +$('#f-ew').value || 0,
