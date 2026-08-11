@@ -14,6 +14,10 @@ if (CONFIG_OK) {
 }
 
 const PESO = n => '₱' + Number(n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const salaryDisplay = n => state.revealSalary ? PESO(n) : '₱••••••••';
+function wireRevealToggles() {
+  $$('[data-reveal-toggle]').forEach(b => b.onclick = () => { state.revealSalary = !state.revealSalary; renderView(); });
+}
 const $ = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
 
@@ -31,6 +35,7 @@ let state = {
   view: 'summary',
   txnPeriodId: null,
   installCardId: null,
+  revealSalary: false,
 };
 
 async function sha256(text) {
@@ -310,6 +315,40 @@ function justineSharedLedgerEntriesForPeriod(periodId) {
   return entries;
 }
 
+// Joven's own installments assigned to "General Ledger" (no specific card) -
+// their full amount counts toward his outflow (replacing what Accent used
+// to do), and pins into the General Ledger list alongside manual entries
+// and Justine's shared-installment deductions.
+function generalLedgerInstallmentEntriesForPeriod(periodId) {
+  const entries = [];
+  state.installments.filter(i => !i.archived && i.owner === 'joven' && !i.card_id).forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      if (periodIdForDate(row.due_date) === periodId) {
+        entries.push({
+          id: 'gl-virtual-' + row.id,
+          description: inst.name,
+          amount: totalAmountForRow(inst, row),
+          wifey_share: totalWifeyShareForRow(inst, row),
+          installmentId: inst.id,
+          virtual: true,
+        });
+      }
+    });
+  });
+  return entries;
+}
+function generalLedgerInstallmentTotalForPeriod(periodId) {
+  return generalLedgerInstallmentEntriesForPeriod(periodId).reduce((s, e) => s + e.amount, 0);
+}
+// Everything shown in the General Ledger section, net - used for the total
+// shown on both the Transactions tab and the Summary card.
+function generalLedgerTotalForPeriod(periodId) {
+  const adjustments = state.wifeyAdjustments.filter(a => a.period_id === periodId).reduce((s, a) => s + Number(a.amount), 0);
+  const shared = justineSharedLedgerEntriesForPeriod(periodId).reduce((s, e) => s + e.amount, 0);
+  const ownInstallments = generalLedgerInstallmentTotalForPeriod(periodId);
+  return adjustments + shared + ownInstallments;
+}
+
 function toLocalISODate(d) {
   // Avoids the classic toISOString() UTC-shift bug that pushes dates back a
   // day for timezones ahead of UTC (like the Philippines).
@@ -341,11 +380,12 @@ function wifeyTotalForPeriod(periodId) {
     .filter(t => t.period_id === periodId)
     .reduce((s, t) => s + Number(t.wifey_share || 0), 0);
   const virtual = virtualEntriesForPeriod(periodId).reduce((s, e) => s + e.wifey_share, 0);
+  const glInstallments = generalLedgerInstallmentEntriesForPeriod(periodId).reduce((s, e) => s + e.wifey_share, 0);
   const adjustments = state.wifeyAdjustments
     .filter(a => a.period_id === periodId)
     .reduce((s, a) => s + Number(a.amount), 0);
   const sharedLedger = justineSharedLedgerEntriesForPeriod(periodId).reduce((s, e) => s + e.amount, 0);
-  return real + virtual + adjustments + sharedLedger;
+  return real + virtual + glInstallments + adjustments + sharedLedger;
 }
 
 function periodTotals(period) {
@@ -353,7 +393,7 @@ function periodTotals(period) {
   const wifeyAmount = wifeyTotalForPeriod(period.id);
   const extraIncome = incomeItemsForPeriod(period.id).reduce((s, i) => s + Number(i.amount), 0);
   const income = Number(period.salary) + Number(period.previous_savings) + wifeyAmount + extraIncome;
-  const outflow = Number(period.accent) + Number(period.spaylater) + cardTotal;
+  const outflow = Number(period.spaylater) + cardTotal + generalLedgerInstallmentTotalForPeriod(period.id);
   const savings = income - outflow;
   return { cardTotal, income, outflow, savings, extraIncome, wifeyAmount };
 }
@@ -392,9 +432,9 @@ function renderSummary() {
           <button class="icon-btn" data-del="${p.id}" title="Delete">✕</button>
         </div>
       </div>
-      <div class="line"><span class="lbl">Salary</span><span class="val">${PESO(p.salary)}</span></div>
+      <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" id="eye-${p.id}" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
       <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
-      <div class="line"><span class="lbl">Wifey <span class="synced-badge" title="Sum of transactions tagged Wifey across all cards this period">⇄ from transactions</span></span><span class="val">${PESO(t.wifeyAmount)}</span></div>
+      <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span></span><span class="val">${PESO(t.wifeyAmount)}</span></div>
       ${incomeItemsForPeriod(p.id).map(item => `
         <div class="line">
           <span class="lbl">${escapeHtml(item.label)}
@@ -404,7 +444,7 @@ function renderSummary() {
           <span class="val">${PESO(item.amount)}</span>
         </div>`).join('')}
       <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
-      <div class="line"><span class="lbl">Accent (car)</span><span class="val">${PESO(p.accent)}</span></div>
+      <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(generalLedgerTotalForPeriod(p.id))}</span></div>
       ${Number(p.spaylater) ? `<div class="line"><span class="lbl">Spaylater</span><span class="val">${PESO(p.spaylater)}</span></div>` : ''}
       ${state.cards.map(c => {
         const amt = cardTotalForPeriod(c.id, p.id);
@@ -417,6 +457,7 @@ function renderSummary() {
     grid.appendChild(el);
   });
   $$('[data-edit]').forEach(b => b.onclick = () => openPeriodModal(periods.find(p => p.id === b.dataset.edit)));
+  wireRevealToggles();
   $$('[data-del]').forEach(b => b.onclick = async () => {
     if (!confirm('Delete this period and all its transactions?')) return;
     await db.from('periods').delete().eq('id', b.dataset.del);
@@ -479,9 +520,8 @@ function openPeriodModal(period) {
     </div>
     <div class="field-row">
       <div class="field"><label>Spaylater</label><input type="number" step="0.01" id="f-spay" value="${p.spaylater}"></div>
-      <div class="field"><label>Accent (car amort)</label><input type="number" step="0.01" id="f-accent" value="${p.accent}"></div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);">Wifey isn't entered here anymore — tag her transactions as "Wifey's" on the Transactions tab and it totals up automatically.</p>
+    <p style="font-size:12px;color:var(--text-dim);">Justine isn't entered here anymore — tag her transactions as "Justine's" on the Transactions tab and it totals up automatically.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -494,7 +534,6 @@ function openPeriodModal(period) {
       salary: +$('#f-salary').value || 0,
       previous_savings: +$('#f-prev').value || 0,
       spaylater: +$('#f-spay').value || 0,
-      accent: +$('#f-accent').value || 0,
     };
     if (!payload.period_date) { toast('Pick a date'); return; }
     let error;
@@ -528,29 +567,36 @@ function renderTransactions() {
         </select>
       </div>
     </div>
-    <div id="card-sections"></div>
     <div class="section-card" id="general-ledger-section">
       <div class="sh">
-        <h3>General ledger <span class="synced-badge" title="Not tied to any card - cash lent, cash paid, or any manual adjustment to what she owes you">not card-specific</span></h3>
+        <h3>General ledger <span class="synced-badge" title="Not tied to any card - cash lent, cash paid, or a general-ledger installment">not card-specific</span></h3>
         <div style="display:flex;align-items:center;gap:14px;">
           <span class="total" id="general-ledger-total"></span>
           <button class="btn secondary" id="add-adjustment-btn" style="padding:6px 12px;font-size:13px;">+ Add</button>
         </div>
       </div>
-      <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">e.g. cash you lent her (positive, adds to what she owes) or cash/expenses you covered for her outside a card (negative, reduces it).</p>
+      <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">e.g. cash you lent her (positive, adds to what she owes), cash/expenses you covered for her (negative, reduces it), or an installment plan you assigned to "General Ledger" instead of a card.</p>
       <div id="general-ledger-rows"></div>
     </div>
+    <div id="card-sections"></div>
   `;
   $('#period-select').onchange = e => { state.txnPeriodId = e.target.value; renderTransactions(); };
 
   const adjustments = state.wifeyAdjustments.filter(a => a.period_id === period.id);
   const sharedEntries = justineSharedLedgerEntriesForPeriod(period.id);
-  const ledgerTotal = adjustments.reduce((s, a) => s + Number(a.amount), 0) + sharedEntries.reduce((s, e) => s + e.amount, 0);
+  const glInstallments = generalLedgerInstallmentEntriesForPeriod(period.id);
+  const ledgerTotal = generalLedgerTotalForPeriod(period.id);
   $('#general-ledger-total').textContent = (ledgerTotal >= 0 ? '+' : '-') + PESO(Math.abs(ledgerTotal));
   const ledgerRows = $('#general-ledger-rows');
-  ledgerRows.innerHTML = (sharedEntries.length || adjustments.length) ? `<table>
+  ledgerRows.innerHTML = (sharedEntries.length || adjustments.length || glInstallments.length) ? `<table>
       <thead><tr><th>Description</th><th class="num">Amount</th><th></th></tr></thead>
       <tbody>
+        ${glInstallments.map(e => `
+          <tr>
+            <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;background:rgba(227,177,88,.15);color:var(--gold);" title="From your installment schedule - click to edit this period's split">⇄ payment plan, edit split</button></td>
+            <td class="num">${PESO(e.amount)}</td>
+            <td></td>
+          </tr>`).join('')}
         ${sharedEntries.map(e => `
           <tr>
             <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From Justine's installment schedule - Joven's share on this plan. Click to edit.">⇄ payment plan, edit split</button></td>
@@ -609,8 +655,8 @@ function renderTransactions() {
             const jShare = e.amount - e.wifey_share;
             let splitHtml;
             if (e.wifey_share <= 0) splitHtml = '<span style="color:var(--text-dim);font-size:12px;">All Joven\'s</span>';
-            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Wifey\'s</span>';
-            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Wifey ${PESO(e.wifey_share)}</span></span>`;
+            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Justine\'s</span>';
+            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Justine ${PESO(e.wifey_share)}</span></span>`;
             return `
             <tr style="background:rgba(227,177,88,.05);">
               <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From the installment schedule - click to edit this period's split">⇄ payment plan, edit split</button></td>
@@ -625,8 +671,8 @@ function renderTransactions() {
             const jShare = Number(t.amount) - wShare;
             let splitHtml;
             if (wShare <= 0) splitHtml = '<span style="color:var(--text-dim);font-size:12px;">All Joven\'s</span>';
-            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Wifey\'s</span>';
-            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Wifey ${PESO(wShare)}</span></span>`;
+            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Justine\'s</span>';
+            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Justine ${PESO(wShare)}</span></span>`;
             return `
             <tr>
               <td>${escapeHtml(t.description)}</td>
@@ -712,7 +758,7 @@ function openTxnModal(txn, cardId, periodId) {
       <button type="button" class="btn secondary" id="split-all-hers" style="padding:6px 10px;font-size:12px;">All hers</button>
     </div>
     <div class="field-row">
-      <div class="field"><label>Wifey's share (₱)</label><input type="number" step="0.01" id="f-wshare" value="${t.wifey_share || 0}"></div>
+      <div class="field"><label>Justine's share (₱)</label><input type="number" step="0.01" id="f-wshare" value="${t.wifey_share || 0}"></div>
       <div class="field"><label>Your share (auto)</label><input type="text" id="f-jshare" value="" disabled style="opacity:.7;"></div>
     </div>
     <div class="modal-actions">
@@ -735,7 +781,7 @@ function openTxnModal(txn, cardId, periodId) {
   $('#modal-save').onclick = async () => {
     const amount = +$('#f-amt').value || 0;
     const wifeyShare = +$('#f-wshare').value || 0;
-    if (wifeyShare < 0 || wifeyShare > amount) { toast("Wifey's share can't be negative or more than the total amount"); return; }
+    if (wifeyShare < 0 || wifeyShare > amount) { toast("Justine's share can't be negative or more than the total amount"); return; }
     const payload = {
       description: $('#f-desc').value.trim(),
       amount,
@@ -779,14 +825,21 @@ function renderInstallments() {
   `;
   $('#add-install-btn').onclick = () => openInstallModal();
 
+  const ownList = state.installments.filter(i => !i.archived && i.owner === state.profile);
+  const cardIdsInUse = new Set(ownList.map(i => i.card_id).filter(Boolean));
+  const hasGeneralLedger = ownList.some(i => !i.card_id);
+  const cardsInUse = state.cards.filter(c => cardIdsInUse.has(c.id));
+
   const tabs = $('#install-tabs');
-  tabs.innerHTML = `<button data-c="all" class="${!state.installCardId ? 'active' : ''}" style="${!state.installCardId ? 'background:var(--gold);color:#1a1200;' : ''}">All cards</button>` +
-    state.cards.map(c => `<button data-c="${c.id}" class="${state.installCardId === c.id ? 'active' : ''}" style="${state.installCardId === c.id ? `background:${c.color};color:#fff;` : ''}">${c.name}</button>`).join('');
+  tabs.innerHTML = `<button data-c="all" class="${!state.installCardId ? 'active' : ''}" style="${!state.installCardId ? 'background:var(--gold);color:#1a1200;' : ''}">All</button>` +
+    cardsInUse.map(c => `<button data-c="${c.id}" class="${state.installCardId === c.id ? 'active' : ''}" style="${state.installCardId === c.id ? `background:${c.color};color:#fff;` : ''}">${c.name}</button>`).join('') +
+    (hasGeneralLedger ? `<button data-c="general" class="${state.installCardId === 'general' ? 'active' : ''}" style="${state.installCardId === 'general' ? 'background:var(--blue);color:#fff;' : ''}">General Ledger</button>` : '');
   $$('#install-tabs button').forEach(b => b.onclick = () => { state.installCardId = b.dataset.c === 'all' ? null : b.dataset.c; renderInstallments(); });
 
   const grid = $('#install-grid');
-  let list = state.installments.filter(i => !i.archived && i.owner === state.profile);
-  if (state.installCardId) list = list.filter(i => i.card_id === state.installCardId);
+  let list = ownList;
+  if (state.installCardId === 'general') list = list.filter(i => !i.card_id);
+  else if (state.installCardId) list = list.filter(i => i.card_id === state.installCardId);
   if (!list.length) { grid.innerHTML = `<div class="empty-state">No installments here yet.</div>`; return; }
 
   list.forEach(i => {
@@ -801,14 +854,12 @@ function renderInstallments() {
     const principal = Number(i.principal) || 0;
     const interest = Math.max(totalToPay - principal, 0);
     const interestPct = totalToPay > 0 ? Math.round((interest / totalToPay) * 100) : 0;
-    const billedCard = i.billed_to_card_id ? state.cards.find(c => c.id === i.billed_to_card_id) : null;
 
     const el = document.createElement('div');
     el.className = 'install-item' + (done ? ' done' : '');
     el.innerHTML = `
       <div class="name">${escapeHtml(i.name)}</div>
-      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : '#888'}"></span>${card ? card.name : 'Unknown'} • ${PESO(i.monthly_amount)}/mo</div>
-      ${billedCard ? `<div class="meta" style="color:var(--blue);">⇄ billed on ${escapeHtml(billedCard.name)}'s statement</div>` : ''}
+      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo</div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%;background:${done ? 'var(--green)' : 'var(--gold)'}"></div></div>
       <div class="foot">
         <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}</span>
@@ -854,7 +905,7 @@ async function regenerateSchedule(inst) {
 function openScheduleModal(inst) {
   const schedule = scheduleForInstallment(inst.id);
   const nextId = nextDueRowId(schedule);
-  const counterpartLabel = inst.owner === 'joven' ? "Wifey's share" : "Joven's share";
+  const counterpartLabel = inst.owner === 'joven' ? "Justine's share" : "Joven's share";
   showModal(`
     <h3>${escapeHtml(inst.name)} — schedule</h3>
     <p style="font-size:12px;color:var(--text-dim);margin-top:-8px;">Green = already paid. Gold = next due. Edit ${counterpartLabel.toLowerCase()} per period if it ever changes.</p>
@@ -904,14 +955,17 @@ function openInstallModal(item) {
   const isEdit = !!item;
   const i = item || {
     card_id: state.cards[0]?.id || '', name: '', principal: '', fee: 0, monthly_amount: '', start_date: '',
-    num_months: 12, payer: '', wifey_monthly_share: 0, wifey_fee_share: 0, billed_to_card_id: '',
+    num_months: 12, payer: '', wifey_monthly_share: 0, wifey_fee_share: 0,
   };
-  const counterpartLabel = state.profile === 'joven' ? "Wifey's" : "Joven's";
+  const counterpartLabel = state.profile === 'joven' ? "Justine's" : "Joven's";
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} installment</h3>
     <div class="field-row">
       <div class="field"><label>Card</label>
-        <select id="f-card">${state.cards.map(c => `<option value="${c.id}" ${c.id === i.card_id ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
+        <select id="f-card">
+          <option value="" ${!i.card_id ? 'selected' : ''}>General Ledger (not tied to a card)</option>
+          ${state.cards.map(c => `<option value="${c.id}" ${c.id === i.card_id ? 'selected' : ''}>${c.name}</option>`).join('')}
+        </select>
       </div>
       <div class="field"><label>Name</label><input type="text" id="f-name" value="${i.name ? escapeHtml(i.name) : ''}" placeholder="e.g. Tanie Tablet"></div>
     </div>
@@ -937,7 +991,7 @@ function openInstallModal(item) {
   `);
   $('#modal-save').onclick = async () => {
     const payload = {
-      card_id: $('#f-card').value,
+      card_id: $('#f-card').value || null,
       name: $('#f-name').value.trim(),
       principal: +$('#f-principal').value || null,
       fee: +$('#f-fee').value || 0,
@@ -1056,12 +1110,30 @@ function openCardModal(card) {
 
 function monthKey(dateStr) { return dateStr.slice(0, 7); } // "2026-08"
 
-function jovenAccentForMonth(monthDate) {
-  // Pulls "Accent" from Joven's 15th and 30th periods in the same calendar month
+// Sum of Joven's 15th + 30th "Justine" line (what he says she owes him) for
+// the same calendar month - this becomes her "Joven CC Total" automatically.
+function jovenJustineTotalForMonth(monthDate) {
   const mk = monthKey(monthDate);
   const p15 = state.periods.find(p => p.period_type === '15th' && monthKey(p.period_date) === mk);
   const p30 = state.periods.find(p => p.period_type === '30th' && monthKey(p.period_date) === mk);
-  return { kuya15: p15 ? Number(p15.accent) : 0, kuya30: p30 ? Number(p30.accent) : 0, hasP15: !!p15, hasP30: !!p30 };
+  let total = 0;
+  if (p15) total += wifeyTotalForPeriod(p15.id);
+  if (p30) total += wifeyTotalForPeriod(p30.id);
+  return { total, hasP15: !!p15, hasP30: !!p30 };
+}
+
+// Her installments assigned to "General Ledger" (no specific card) - just a
+// running total on her Summary, no line-item breakdown since she has no
+// Transactions tab.
+function justineGeneralLedgerTotalForMonth(monthDate) {
+  const mk = monthKey(monthDate);
+  let total = 0;
+  state.installments.filter(i => !i.archived && i.owner === 'justine' && !i.card_id).forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      if (monthKey(row.due_date) === mk) total += totalAmountForRow(inst, row);
+    });
+  });
+  return total;
 }
 
 function justineBillsForMonth(monthId) {
@@ -1069,12 +1141,13 @@ function justineBillsForMonth(monthId) {
 }
 
 function justineTotals(m) {
-  const { kuya15, kuya30 } = jovenAccentForMonth(m.month_date);
+  const jovenCc = jovenJustineTotalForMonth(m.month_date);
   const billsTotal = justineBillsForMonth(m.id).reduce((s, b) => s + Number(b.amount), 0);
-  const payablesTotal = Number(m.bpi_total) + Number(m.eastwest_total) + billsTotal + kuya15 + kuya30;
-  const totalOutflow = Number(m.joven_cc_total) + payablesTotal;
+  const generalLedger = justineGeneralLedgerTotalForMonth(m.month_date);
+  const payablesTotal = Number(m.bpi_total) + Number(m.eastwest_total) + billsTotal + generalLedger;
+  const totalOutflow = jovenCc.total + payablesTotal;
   const savings = Number(m.paycheck_budget) - totalOutflow;
-  return { kuya15, kuya30, billsTotal, payablesTotal, totalOutflow, savings };
+  return { billsTotal, payablesTotal, totalOutflow, savings, jovenCc, generalLedger };
 }
 
 function renderJustineSummary() {
@@ -1096,7 +1169,6 @@ function renderJustineSummary() {
   state.justineMonths.forEach(m => {
     const t = justineTotals(m);
     const monthLabel = new Date(m.month_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
-    const acc = jovenAccentForMonth(m.month_date);
     const el = document.createElement('div');
     el.className = 'period-card';
     el.innerHTML = `
@@ -1107,10 +1179,11 @@ function renderJustineSummary() {
           <button class="icon-btn" data-del-m="${m.id}" title="Delete">✕</button>
         </div>
       </div>
-      <div class="line"><span class="lbl">💰</span><span class="val">${PESO(m.paycheck_budget)}</span></div>
-      <div class="line"><span class="lbl">Joven CC Total</span><span class="val">${PESO(m.joven_cc_total)}</span></div>
+      <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
+      <div class="line"><span class="lbl">Joven CC Total <span class="synced-badge" title="Sum of Joven's Justine line on his 15th + 30th periods this month">⇄ synced</span></span><span class="val">${(t.jovenCc.hasP15 || t.jovenCc.hasP30) ? PESO(t.jovenCc.total) : '<span style="color:var(--text-dim)">no periods yet</span>'}</span></div>
       <div class="line"><span class="lbl">BPI</span><span class="val">${PESO(m.bpi_total)}</span></div>
       <div class="line"><span class="lbl">Eastwest</span><span class="val">${PESO(m.eastwest_total)}</span></div>
+      <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(t.generalLedger)}</span></div>
       ${justineBillsForMonth(m.id).map(b => `
         <div class="line">
           <span class="lbl">${escapeHtml(b.label)}
@@ -1120,8 +1193,6 @@ function renderJustineSummary() {
           <span class="val">${PESO(b.amount)}</span>
         </div>`).join('')}
       <div class="line"><span class="lbl"><button class="icon-btn" data-add-bill="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ bill</button></span><span class="val"></span></div>
-      <div class="line"><span class="lbl">Kuya Edrian 15 <span class="synced-badge" title="Same as Joven's Accent, pulled automatically">⇄ synced</span></span><span class="val">${acc.hasP15 ? PESO(t.kuya15) : '<span style="color:var(--text-dim)">no 15th period yet</span>'}</span></div>
-      <div class="line"><span class="lbl">Kuya Edrian 30 <span class="synced-badge" title="Same as Joven's Accent, pulled automatically">⇄ synced</span></span><span class="val">${acc.hasP30 ? PESO(t.kuya30) : '<span style="color:var(--text-dim)">no 30th period yet</span>'}</span></div>
       <div class="line"><span class="lbl">Payables total</span><span class="val">${PESO(t.payablesTotal)}</span></div>
       <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.totalOutflow)}</span></div>
       <div class="line savings total"><span class="lbl">Savings</span><span class="val">${PESO(t.savings)}</span></div>
@@ -1129,6 +1200,7 @@ function renderJustineSummary() {
     grid.appendChild(el);
   });
   $$('[data-edit-m]').forEach(b => b.onclick = () => openJustineMonthModal(state.justineMonths.find(m => m.id === b.dataset.editM)));
+  wireRevealToggles();
   $$('[data-del-m]').forEach(b => b.onclick = async () => {
     if (!confirm('Delete this month?')) return;
     await db.from('justine_months').delete().eq('id', b.dataset.delM);
@@ -1148,7 +1220,7 @@ function renderJustineSummary() {
 
 function openJustineMonthModal(month) {
   const isEdit = !!month;
-  const m = month || { month_date: '', paycheck_budget: 0, joven_cc_total: 0, bpi_total: 0, eastwest_total: 0 };
+  const m = month || { month_date: '', paycheck_budget: 0, bpi_total: 0, eastwest_total: 0 };
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} month</h3>
     <div class="field-row">
@@ -1156,13 +1228,12 @@ function openJustineMonthModal(month) {
     </div>
     <div class="field-row">
       <div class="field"><label>💰 Paycheck Budget</label><input type="number" step="0.01" id="f-budget" value="${m.paycheck_budget}"></div>
-      <div class="field"><label>Joven CC Total</label><input type="number" step="0.01" id="f-joven" value="${m.joven_cc_total}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>BPI</label><input type="number" step="0.01" id="f-bpi" value="${m.bpi_total}"></div>
       <div class="field"><label>Eastwest</label><input type="number" step="0.01" id="f-ew" value="${m.eastwest_total}"></div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);">Kuya Edrian 15/30 aren't entered here — they're pulled automatically from Joven's Accent on his 15th/30th periods for this same month. Savings = 💰 minus everything above and the bills below.</p>
+    <p style="font-size:12px;color:var(--text-dim);">Joven CC Total isn't entered here — it's automatically the sum of Joven's "Justine" line on his 15th + 30th periods for this same month. Savings = 💰 minus everything below.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -1174,7 +1245,6 @@ function openJustineMonthModal(month) {
     const payload = {
       month_date: monthVal + '-01',
       paycheck_budget: +$('#f-budget').value || 0,
-      joven_cc_total: +$('#f-joven').value || 0,
       bpi_total: +$('#f-bpi').value || 0,
       eastwest_total: +$('#f-ew').value || 0,
     };
