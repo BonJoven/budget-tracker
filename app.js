@@ -430,9 +430,9 @@ function renderSummary() {
   const archivedPeriods = state.periods.filter(p => p.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Summary</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
+      <div><h2>Joven</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
       <div style="display:flex;gap:8px;">
-        ${archivedPeriods.length ? `<button class="btn secondary" id="toggle-archived-periods">${state.showArchivedPeriods ? 'Hide' : 'Show'} archived (${archivedPeriods.length})</button>` : ''}
+        ${state.showArchivedPeriods ? `<button class="btn secondary" id="toggle-archived-periods">← Back to active</button>` : archivedPeriods.length ? `<button class="btn secondary" id="toggle-archived-periods">Show archived (${archivedPeriods.length})</button>` : ''}
         <button class="btn" id="add-period-btn">+ New period</button>
       </div>
     </div>
@@ -870,7 +870,7 @@ function renderInstallments() {
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
       <div><h2>Installments</h2><div class="subtitle">Payment plans, split by period, and when each one finishes</div></div>
       <div style="display:flex;gap:8px;">
-        ${archivedList.length ? `<button class="btn secondary" id="toggle-archived-installments">${state.showArchivedInstallments ? 'Hide' : 'Show'} archived (${archivedList.length})</button>` : ''}
+        ${state.showArchivedInstallments ? `<button class="btn secondary" id="toggle-archived-installments">← Back to active</button>` : archivedList.length ? `<button class="btn secondary" id="toggle-archived-installments">Show archived (${archivedList.length})</button>` : ''}
         <button class="btn" id="add-install-btn">+ New installment</button>
       </div>
     </div>
@@ -1225,9 +1225,9 @@ function renderJustineSummary() {
   const archivedMonths = state.justineMonths.filter(m => m.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Justine's Budget</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
+      <div><h2>Justine</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
       <div style="display:flex;gap:8px;">
-        ${archivedMonths.length ? `<button class="btn secondary" id="toggle-archived-months">${state.showArchivedMonths ? 'Hide' : 'Show'} archived (${archivedMonths.length})</button>` : ''}
+        ${state.showArchivedMonths ? `<button class="btn secondary" id="toggle-archived-months">← Back to active</button>` : archivedMonths.length ? `<button class="btn secondary" id="toggle-archived-months">Show archived (${archivedMonths.length})</button>` : ''}
         <button class="btn" id="add-month-btn">+ New month</button>
       </div>
     </div>
@@ -1384,6 +1384,7 @@ function showModal(html) {
   $('#modal-body').innerHTML = html;
   $('#modal-backdrop').classList.add('active');
   $('#modal-cancel').onclick = closeModal;
+  $('#modal-backdrop').onclick = e => { if (e.target.id === 'modal-backdrop') closeModal(); };
 }
 function closeModal() { $('#modal-backdrop').classList.remove('active'); }
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
