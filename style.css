@@ -368,11 +368,12 @@ tr:hover td{background:var(--surface2);}
   animation:starDrift 140s linear infinite reverse;
   opacity:.8;
 }
-#app.theme-justine #sidebar,
-#app.theme-justine #main{
-  position:relative;
-  z-index:1;
-}
+/* Note: no z-index override needed for #sidebar/#main - the ::before pseudo
+   uses z-index:-1, which paints below normal in-flow content automatically
+   within #app's stacking context. An earlier version added an explicit
+   z-index:1 rule here, but its high selector specificity accidentally
+   overrode the mobile drawer's position:fixed rule, breaking the sidebar
+   on phones. Removed. */
 @keyframes starDrift{
   from{background-position:0 0;}
   to{background-position:-1000px 500px;}
