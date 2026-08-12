@@ -430,7 +430,7 @@ function renderSummary() {
   const archivedPeriods = state.periods.filter(p => p.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Joven</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
+      <div><h2>Summary</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
       <div style="display:flex;gap:8px;">
         ${archivedPeriods.length ? `<button class="btn secondary" id="toggle-archived-periods">${state.showArchivedPeriods ? 'Hide' : 'Show'} archived (${archivedPeriods.length})</button>` : ''}
         <button class="btn" id="add-period-btn">+ New period</button>
@@ -1225,7 +1225,7 @@ function renderJustineSummary() {
   const archivedMonths = state.justineMonths.filter(m => m.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Justine</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
+      <div><h2>Justine's Budget</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
       <div style="display:flex;gap:8px;">
         ${archivedMonths.length ? `<button class="btn secondary" id="toggle-archived-months">${state.showArchivedMonths ? 'Hide' : 'Show'} archived (${archivedMonths.length})</button>` : ''}
         <button class="btn" id="add-month-btn">+ New month</button>
