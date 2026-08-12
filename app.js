@@ -18,6 +18,21 @@ const salaryDisplay = n => state.revealSalary ? PESO(n) : '₱••••••
 function wireRevealToggles() {
   $$('[data-reveal-toggle]').forEach(b => b.onclick = () => { state.revealSalary = !state.revealSalary; renderView(); });
 }
+
+function parseStatementDay(text) {
+  if (!text) return null;
+  const m = String(text).match(/\d+/);
+  return m ? parseInt(m[0], 10) : null;
+}
+function hasStatementArrived(card) {
+  const day = parseStatementDay(card.statement_day);
+  if (!day) return false;
+  return new Date().getDate() >= day;
+}
+function statementBadge(card) {
+  if (!hasStatementArrived(card)) return '';
+  return ` <span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);" title="Statement day (${card.statement_day}) has passed this month">🧾 statement in</span>`;
+}
 const $ = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
 
@@ -36,6 +51,9 @@ let state = {
   txnPeriodId: null,
   installCardId: null,
   revealSalary: false,
+  showArchivedPeriods: false,
+  showArchivedMonths: false,
+  showArchivedInstallments: false,
 };
 
 async function sha256(text) {
@@ -155,6 +173,7 @@ async function enterApp() {
   $('#login-screen').style.display = 'none';
   $('#app').classList.add('active');
   await loadAll();
+  applyProfileTheme();
   renderSidebar();
   renderView();
 }
@@ -207,11 +226,16 @@ function renderSidebar() {
   $$('#profile-switch button').forEach(b => b.onclick = () => {
     state.profile = b.dataset.profile;
     state.view = 'summary';
+    applyProfileTheme();
     renderSidebar();
     renderView();
   });
   $$('.nav-btn').forEach(b => b.onclick = () => { state.view = b.dataset.view; renderView(); closeMobileSidebar(); });
   $('#logout-btn').onclick = logout;
+}
+
+function applyProfileTheme() {
+  $('#app').classList.toggle('theme-justine', state.profile === 'justine');
 }
 
 function renderView() {
@@ -393,7 +417,7 @@ function periodTotals(period) {
   const wifeyAmount = wifeyTotalForPeriod(period.id);
   const extraIncome = incomeItemsForPeriod(period.id).reduce((s, i) => s + Number(i.amount), 0);
   const income = Number(period.salary) + Number(period.previous_savings) + wifeyAmount + extraIncome;
-  const outflow = Number(period.spaylater) + cardTotal + generalLedgerInstallmentTotalForPeriod(period.id);
+  const outflow = cardTotal + generalLedgerInstallmentTotalForPeriod(period.id);
   const savings = income - outflow;
   return { cardTotal, income, outflow, savings, extraIncome, wifeyAmount };
 }
@@ -402,15 +426,21 @@ function periodTotals(period) {
 
 function renderSummary() {
   const main = $('#main');
-  const periods = state.periods;
+  const periods = state.periods.filter(p => !p.archived);
+  const archivedPeriods = state.periods.filter(p => p.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Joven</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
-      <button class="btn" id="add-period-btn">+ New period</button>
+      <div><h2>Summary</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
+      <div style="display:flex;gap:8px;">
+        ${archivedPeriods.length ? `<button class="btn secondary" id="toggle-archived-periods">${state.showArchivedPeriods ? 'Hide' : 'Show'} archived (${archivedPeriods.length})</button>` : ''}
+        <button class="btn" id="add-period-btn">+ New period</button>
+      </div>
     </div>
     <div class="period-grid" id="period-grid"></div>
+    ${state.showArchivedPeriods && archivedPeriods.length ? `<h3 style="font-family:'Space Grotesk',sans-serif;font-size:15px;margin:24px 0 12px;color:var(--text-dim);">Archived</h3><div class="period-grid" id="archived-period-grid"></div>` : ''}
   `;
   $('#add-period-btn').onclick = () => openPeriodModal();
+  if ($('#toggle-archived-periods')) $('#toggle-archived-periods').onclick = () => { state.showArchivedPeriods = !state.showArchivedPeriods; renderSummary(); };
 
   const grid = $('#period-grid');
   if (!periods.length) {
@@ -425,11 +455,11 @@ function renderSummary() {
       <div class="ph">
         <div>
           <span class="tag">${p.period_type}</span>
-          <div class="date">${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', day: 'numeric', year: 'numeric' })}</div>
+          <div class="date">${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>
         </div>
         <div>
           <button class="icon-btn edit" data-edit="${p.id}" title="Edit">✎</button>
-          <button class="icon-btn" data-del="${p.id}" title="Delete">✕</button>
+          <button class="icon-btn" data-archive="${p.id}" title="Archive">📦</button>
         </div>
       </div>
       <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" id="eye-${p.id}" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
@@ -445,22 +475,20 @@ function renderSummary() {
         </div>`).join('')}
       <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
       <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(generalLedgerTotalForPeriod(p.id))}</span></div>
-      ${Number(p.spaylater) ? `<div class="line"><span class="lbl">Spaylater</span><span class="val">${PESO(p.spaylater)}</span></div>` : ''}
       ${state.cards.map(c => {
         const amt = cardTotalForPeriod(c.id, p.id);
         if (!amt) return '';
-        return `<div class="line"><span class="lbl card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}</span><span class="val">${PESO(amt)}</span></div>`;
+        return `<div class="line"><span class="lbl card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}${statementBadge(c)}</span><span class="val">${PESO(amt)}</span></div>`;
       }).join('')}
       <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.outflow)}</span></div>
-      <div class="line savings total"><span class="lbl">Savings</span><span class="val">${PESO(t.savings)}</span></div>
+      <div class="line savings total"><span class="lbl">Savings</span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
     `;
     grid.appendChild(el);
   });
   $$('[data-edit]').forEach(b => b.onclick = () => openPeriodModal(periods.find(p => p.id === b.dataset.edit)));
   wireRevealToggles();
-  $$('[data-del]').forEach(b => b.onclick = async () => {
-    if (!confirm('Delete this period and all its transactions?')) return;
-    await db.from('periods').delete().eq('id', b.dataset.del);
+  $$('[data-archive]').forEach(b => b.onclick = async () => {
+    await db.from('periods').update({ archived: true }).eq('id', b.dataset.archive);
     await loadAll(); renderView();
   });
   $$('[data-add-income]').forEach(b => b.onclick = () => openIncomeItemModal(null, b.dataset.addIncome));
@@ -473,6 +501,30 @@ function renderSummary() {
     await db.from('income_items').delete().eq('id', b.dataset.delIncome);
     await loadAll(); renderView();
   });
+
+  if (state.showArchivedPeriods && archivedPeriods.length) {
+    const ag = $('#archived-period-grid');
+    archivedPeriods.forEach(p => {
+      const el = document.createElement('div');
+      el.className = 'period-card';
+      el.style.opacity = '.6';
+      el.innerHTML = `
+        <div class="ph">
+          <div>
+            <span class="tag">${p.period_type}</span>
+            <div class="date">${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>
+          </div>
+          <div><button class="icon-btn edit" data-restore="${p.id}" title="Restore">♻️</button></div>
+        </div>
+        <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)}</span></div>
+      `;
+      ag.appendChild(el);
+    });
+    $$('[data-restore]').forEach(b => b.onclick = async () => {
+      await db.from('periods').update({ archived: false }).eq('id', b.dataset.restore);
+      await loadAll(); renderView();
+    });
+  }
 }
 
 function openIncomeItemModal(item, periodId) {
@@ -502,7 +554,7 @@ function openIncomeItemModal(item, periodId) {
 
 function openPeriodModal(period) {
   const isEdit = !!period;
-  const p = period || { period_date: '', period_type: '15th', salary: 0, previous_savings: 0, wifey: 0, spaylater: 0, accent: 0 };
+  const p = period || { period_date: '', period_type: '15th', salary: 0, previous_savings: 0, wifey: 0 };
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} period</h3>
     <div class="field-row">
@@ -518,10 +570,7 @@ function openPeriodModal(period) {
       <div class="field"><label>Salary</label><input type="number" step="0.01" id="f-salary" value="${p.salary}"></div>
       <div class="field"><label>Previous savings</label><input type="number" step="0.01" id="f-prev" value="${p.previous_savings}"></div>
     </div>
-    <div class="field-row">
-      <div class="field"><label>Spaylater</label><input type="number" step="0.01" id="f-spay" value="${p.spaylater}"></div>
-    </div>
-    <p style="font-size:12px;color:var(--text-dim);">Justine isn't entered here anymore — tag her transactions as "Justine's" on the Transactions tab and it totals up automatically.</p>
+    <p style="font-size:12px;color:var(--text-dim);">Justine isn't entered here anymore — tag her transactions as "Justine's" on the Transactions tab and it totals up automatically. Spaylater isn't here either — add it as a General Ledger installment instead.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -533,7 +582,6 @@ function openPeriodModal(period) {
       period_type: $('#f-type').value,
       salary: +$('#f-salary').value || 0,
       previous_savings: +$('#f-prev').value || 0,
-      spaylater: +$('#f-spay').value || 0,
     };
     if (!payload.period_date) { toast('Pick a date'); return; }
     let error;
@@ -548,14 +596,15 @@ function openPeriodModal(period) {
 
 function renderTransactions() {
   const main = $('#main');
-  if (!state.periods.length) {
+  const activePeriods = state.periods.filter(p => !p.archived);
+  if (!activePeriods.length) {
     main.innerHTML = `<h2>Transactions</h2><div class="empty-state">Add a period first (Summary tab), then come back here.</div>`;
     return;
   }
-  if (!state.txnPeriodId || !state.periods.find(p => p.id === state.txnPeriodId)) {
-    state.txnPeriodId = state.periods[0].id;
+  if (!state.txnPeriodId || !activePeriods.find(p => p.id === state.txnPeriodId)) {
+    state.txnPeriodId = activePeriods[0].id;
   }
-  const period = state.periods.find(p => p.id === state.txnPeriodId);
+  const period = activePeriods.find(p => p.id === state.txnPeriodId);
 
   main.innerHTML = `
     <h2>Transactions</h2>
@@ -563,7 +612,7 @@ function renderTransactions() {
     <div class="field-row" style="max-width:320px;margin-bottom:18px;">
       <div class="field"><label>Period</label>
         <select id="period-select">
-          ${state.periods.map(p => `<option value="${p.id}" ${p.id === state.txnPeriodId ? 'selected' : ''}>${p.period_type} — ${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })}</option>`).join('')}
+          ${activePeriods.map(p => `<option value="${p.id}" ${p.id === state.txnPeriodId ? 'selected' : ''}>${p.period_type} — ${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })}</option>`).join('')}
         </select>
       </div>
     </div>
@@ -642,7 +691,7 @@ function renderTransactions() {
     sec.className = 'section-card';
     sec.innerHTML = `
       <div class="sh">
-        <h3><span class="card-chip"><span class="sw" style="background:${card.color}"></span>${card.name}</span></h3>
+        <h3><span class="card-chip"><span class="sw" style="background:${card.color}"></span>${card.name}${statementBadge(card)}</span></h3>
         <div style="display:flex;align-items:center;gap:14px;">
           <span class="total">${PESO(total)}</span>
           <button class="btn secondary" data-add="${card.id}" style="padding:6px 12px;font-size:13px;">+ Add</button>
@@ -815,17 +864,23 @@ function nextDueRowId(schedule) {
 
 function renderInstallments() {
   const main = $('#main');
+  const ownAll = state.installments.filter(i => i.owner === state.profile);
+  const archivedList = ownAll.filter(i => i.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
       <div><h2>Installments</h2><div class="subtitle">Payment plans, split by period, and when each one finishes</div></div>
-      <button class="btn" id="add-install-btn">+ New installment</button>
+      <div style="display:flex;gap:8px;">
+        ${archivedList.length ? `<button class="btn secondary" id="toggle-archived-installments">${state.showArchivedInstallments ? 'Hide' : 'Show'} archived (${archivedList.length})</button>` : ''}
+        <button class="btn" id="add-install-btn">+ New installment</button>
+      </div>
     </div>
     <div class="card-select-tabs" id="install-tabs"></div>
     <div class="install-grid" id="install-grid"></div>
   `;
   $('#add-install-btn').onclick = () => openInstallModal();
+  if ($('#toggle-archived-installments')) $('#toggle-archived-installments').onclick = () => { state.showArchivedInstallments = !state.showArchivedInstallments; renderInstallments(); };
 
-  const ownList = state.installments.filter(i => !i.archived && i.owner === state.profile);
+  const ownList = ownAll.filter(i => state.showArchivedInstallments ? i.archived : !i.archived);
   const cardIdsInUse = new Set(ownList.map(i => i.card_id).filter(Boolean));
   const hasGeneralLedger = ownList.some(i => !i.card_id);
   const cardsInUse = state.cards.filter(c => cardIdsInUse.has(c.id));
@@ -840,7 +895,7 @@ function renderInstallments() {
   let list = ownList;
   if (state.installCardId === 'general') list = list.filter(i => !i.card_id);
   else if (state.installCardId) list = list.filter(i => i.card_id === state.installCardId);
-  if (!list.length) { grid.innerHTML = `<div class="empty-state">No installments here yet.</div>`; return; }
+  if (!list.length) { grid.innerHTML = `<div class="empty-state">${state.showArchivedInstallments ? 'No archived installments.' : 'No installments here yet.'}</div>`; return; }
 
   list.forEach(i => {
     const card = state.cards.find(c => c.id === i.card_id);
@@ -857,6 +912,7 @@ function renderInstallments() {
 
     const el = document.createElement('div');
     el.className = 'install-item' + (done ? ' done' : '');
+    if (i.archived) el.style.opacity = '.6';
     el.innerHTML = `
       <div class="name">${escapeHtml(i.name)}</div>
       <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo</div>
@@ -878,8 +934,13 @@ function renderInstallments() {
       <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
         <button class="btn secondary" data-view-sched="${i.id}" style="padding:6px 12px;font-size:12px;">View schedule</button>
         <div>
-          <button class="icon-btn edit" data-edit-i="${i.id}">✎</button>
-          <button class="icon-btn" data-del-i="${i.id}">✕</button>
+          ${i.archived ? `
+            <button class="icon-btn edit" data-restore-i="${i.id}" title="Restore">♻️</button>
+            <button class="icon-btn" data-del-i="${i.id}" title="Delete permanently">✕</button>
+          ` : `
+            <button class="icon-btn edit" data-edit-i="${i.id}">✎</button>
+            <button class="icon-btn" data-archive-i="${i.id}" title="Archive">📦</button>
+          `}
         </div>
       </div>
     `;
@@ -887,8 +948,16 @@ function renderInstallments() {
   });
   $$('[data-edit-i]').forEach(b => b.onclick = () => openInstallModal(state.installments.find(x => x.id === b.dataset.editI)));
   $$('[data-view-sched]').forEach(b => b.onclick = () => openScheduleModal(state.installments.find(x => x.id === b.dataset.viewSched)));
+  $$('[data-archive-i]').forEach(b => b.onclick = async () => {
+    await db.from('installments').update({ archived: true }).eq('id', b.dataset.archiveI);
+    await loadAll(); renderView();
+  });
+  $$('[data-restore-i]').forEach(b => b.onclick = async () => {
+    await db.from('installments').update({ archived: false }).eq('id', b.dataset.restoreI);
+    await loadAll(); renderView();
+  });
   $$('[data-del-i]').forEach(b => b.onclick = async () => {
-    if (!confirm('Delete this installment plan and its schedule?')) return;
+    if (!confirm('Permanently delete this installment plan and its schedule? This can\'t be undone.')) return;
     await db.from('installments').delete().eq('id', b.dataset.delI);
     await loadAll(); renderView();
   });
@@ -1152,21 +1221,28 @@ function justineTotals(m) {
 
 function renderJustineSummary() {
   const main = $('#main');
+  const months = state.justineMonths.filter(m => !m.archived);
+  const archivedMonths = state.justineMonths.filter(m => m.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-end;">
-      <div><h2>Justine</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
-      <button class="btn" id="add-month-btn">+ New month</button>
+      <div><h2>Justine's Budget</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
+      <div style="display:flex;gap:8px;">
+        ${archivedMonths.length ? `<button class="btn secondary" id="toggle-archived-months">${state.showArchivedMonths ? 'Hide' : 'Show'} archived (${archivedMonths.length})</button>` : ''}
+        <button class="btn" id="add-month-btn">+ New month</button>
+      </div>
     </div>
     <div class="period-grid" id="month-grid"></div>
+    ${state.showArchivedMonths && archivedMonths.length ? `<h3 style="font-family:'Space Grotesk',sans-serif;font-size:15px;margin:24px 0 12px;color:var(--text-dim);">Archived</h3><div class="period-grid" id="archived-month-grid"></div>` : ''}
   `;
   $('#add-month-btn').onclick = () => openJustineMonthModal();
+  if ($('#toggle-archived-months')) $('#toggle-archived-months').onclick = () => { state.showArchivedMonths = !state.showArchivedMonths; renderJustineSummary(); };
 
   const grid = $('#month-grid');
-  if (!state.justineMonths.length) {
+  if (!months.length) {
     grid.innerHTML = `<div class="empty-state">No months yet. Click "New month" to add August.</div>`;
     return;
   }
-  state.justineMonths.forEach(m => {
+  months.forEach(m => {
     const t = justineTotals(m);
     const monthLabel = new Date(m.month_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
     const el = document.createElement('div');
@@ -1176,7 +1252,7 @@ function renderJustineSummary() {
         <div><span class="tag">${monthLabel}</span></div>
         <div>
           <button class="icon-btn edit" data-edit-m="${m.id}" title="Edit">✎</button>
-          <button class="icon-btn" data-del-m="${m.id}" title="Delete">✕</button>
+          <button class="icon-btn" data-archive-m="${m.id}" title="Archive">📦</button>
         </div>
       </div>
       <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
@@ -1195,15 +1271,14 @@ function renderJustineSummary() {
       <div class="line"><span class="lbl"><button class="icon-btn" data-add-bill="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ bill</button></span><span class="val"></span></div>
       <div class="line"><span class="lbl">Payables total</span><span class="val">${PESO(t.payablesTotal)}</span></div>
       <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.totalOutflow)}</span></div>
-      <div class="line savings total"><span class="lbl">Savings</span><span class="val">${PESO(t.savings)}</span></div>
+      <div class="line savings total"><span class="lbl">Savings</span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
     `;
     grid.appendChild(el);
   });
   $$('[data-edit-m]').forEach(b => b.onclick = () => openJustineMonthModal(state.justineMonths.find(m => m.id === b.dataset.editM)));
   wireRevealToggles();
-  $$('[data-del-m]').forEach(b => b.onclick = async () => {
-    if (!confirm('Delete this month?')) return;
-    await db.from('justine_months').delete().eq('id', b.dataset.delM);
+  $$('[data-archive-m]').forEach(b => b.onclick = async () => {
+    await db.from('justine_months').update({ archived: true }).eq('id', b.dataset.archiveM);
     await loadAll(); renderView();
   });
   $$('[data-add-bill]').forEach(b => b.onclick = () => openJustineBillModal(null, b.dataset.addBill));
@@ -1216,6 +1291,28 @@ function renderJustineSummary() {
     await db.from('justine_bills').delete().eq('id', b.dataset.delBill);
     await loadAll(); renderView();
   });
+
+  if (state.showArchivedMonths && archivedMonths.length) {
+    const ag = $('#archived-month-grid');
+    archivedMonths.forEach(m => {
+      const monthLabel = new Date(m.month_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
+      const el = document.createElement('div');
+      el.className = 'period-card';
+      el.style.opacity = '.6';
+      el.innerHTML = `
+        <div class="ph">
+          <div><span class="tag">${monthLabel}</span></div>
+          <div><button class="icon-btn edit" data-restore-m="${m.id}" title="Restore">♻️</button></div>
+        </div>
+        <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(m.paycheck_budget)}</span></div>
+      `;
+      ag.appendChild(el);
+    });
+    $$('[data-restore-m]').forEach(b => b.onclick = async () => {
+      await db.from('justine_months').update({ archived: false }).eq('id', b.dataset.restoreM);
+      await loadAll(); renderView();
+    });
+  }
 }
 
 function openJustineMonthModal(month) {
