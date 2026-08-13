@@ -429,7 +429,7 @@ function renderSummary() {
   const periods = state.periods.filter(p => !p.archived);
   const archivedPeriods = state.periods.filter(p => p.archived);
   main.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:flex-end;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
       <div><h2>Joven</h2><div class="subtitle">Income, outflow & savings per pay period</div></div>
       <div style="display:flex;gap:8px;">
         ${state.showArchivedPeriods ? `<button class="btn secondary" id="toggle-archived-periods">← Back to active</button>` : archivedPeriods.length ? `<button class="btn secondary" id="toggle-archived-periods">Show archived (${archivedPeriods.length})</button>` : ''}
@@ -867,7 +867,7 @@ function renderInstallments() {
   const ownAll = state.installments.filter(i => i.owner === state.profile);
   const archivedList = ownAll.filter(i => i.archived);
   main.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:flex-end;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
       <div><h2>Installments</h2><div class="subtitle">Payment plans, split by period, and when each one finishes</div></div>
       <div style="display:flex;gap:8px;">
         ${state.showArchivedInstallments ? `<button class="btn secondary" id="toggle-archived-installments">← Back to active</button>` : archivedList.length ? `<button class="btn secondary" id="toggle-archived-installments">Show archived (${archivedList.length})</button>` : ''}
@@ -1102,7 +1102,7 @@ function openInstallModal(item) {
 function renderSettings() {
   const main = $('#main');
   main.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:flex-end;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
       <div><h2>Cards & Settings</h2><div class="subtitle">Manage your credit cards and shared password</div></div>
       <button class="btn" id="add-card-btn">+ Add card</button>
     </div>
@@ -1224,7 +1224,7 @@ function renderJustineSummary() {
   const months = state.justineMonths.filter(m => !m.archived);
   const archivedMonths = state.justineMonths.filter(m => m.archived);
   main.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:flex-end;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
       <div><h2>Justine</h2><div class="subtitle">Monthly paycheck budget & payables</div></div>
       <div style="display:flex;gap:8px;">
         ${state.showArchivedMonths ? `<button class="btn secondary" id="toggle-archived-months">← Back to active</button>` : archivedMonths.length ? `<button class="btn secondary" id="toggle-archived-months">Show archived (${archivedMonths.length})</button>` : ''}
@@ -1269,11 +1269,21 @@ function renderJustineSummary() {
           <span class="val">${PESO(b.amount)}</span>
         </div>`).join('')}
       <div class="line"><span class="lbl"><button class="icon-btn" data-add-bill="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ bill</button></span><span class="val"></span></div>
-      <div class="line"><span class="lbl">Payables total</span><span class="val">${PESO(t.payablesTotal)}</span></div>
       <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.totalOutflow)}</span></div>
       <div class="line savings total"><span class="lbl">Savings</span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">
+        <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;">Notes</label>
+        <textarea data-notes-for="${m.id}" placeholder="Jot anything down here…" style="width:100%;min-height:60px;margin-top:6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-family:inherit;font-size:13px;resize:vertical;">${m.notes ? escapeHtml(m.notes) : ''}</textarea>
+      </div>
     `;
     grid.appendChild(el);
+  });
+  $$('[data-notes-for]').forEach(t => {
+    t.onblur = async () => {
+      await db.from('justine_months').update({ notes: t.value }).eq('id', t.dataset.notesFor);
+      const m = state.justineMonths.find(x => x.id === t.dataset.notesFor);
+      if (m) m.notes = t.value; // keep local state in sync without a full reload/re-render
+    };
   });
   $$('[data-edit-m]').forEach(b => b.onclick = () => openJustineMonthModal(state.justineMonths.find(m => m.id === b.dataset.editM)));
   wireRevealToggles();
