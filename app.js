@@ -57,6 +57,7 @@ let state = {
   showArchivedPeriods: false,
   showArchivedMonths: false,
   showArchivedInstallments: false,
+  showInstallDashboard: true,
 };
 
 async function sha256(text) {
@@ -917,6 +918,140 @@ function openTxnModal(txn, cardId, periodId) {
 
 /* ---------------- INSTALLMENTS VIEW ---------------- */
 
+function installmentMetrics(i) {
+  const schedule = scheduleForInstallment(i.id);
+  const principal = Number(i.principal) || 0;
+  const fee = Number(i.fee) || 0;
+  const totalToPay = schedule.reduce((s, r) => s + totalAmountForRow(i, r), 0);
+  const interest = Math.max(totalToPay - principal - fee, 0);   // pure installment interest, excluding the one-time fee
+  const financeCharge = interest + fee;                          // total cost of credit for this plan
+  const remaining = schedule.filter(r => scheduleStatus(r.due_date) !== 'paid').reduce((s, r) => s + totalAmountForRow(i, r), 0);
+  const paidCount = schedule.filter(r => scheduleStatus(r.due_date) === 'paid').length;
+  const done = schedule.length > 0 && paidCount >= schedule.length;
+  const endDate = schedule.length ? schedule[schedule.length - 1].due_date : null;
+  const card = state.cards.find(c => c.id === i.card_id) || null;
+  return { schedule, principal, fee, totalToPay, interest, financeCharge, remaining, done, endDate, card, monthly: Number(i.monthly_amount) || 0 };
+}
+
+// Rough monthly income used for the debt-to-income stat: Joven's latest two
+// periods (a 15th + 30th pair), or Justine's latest month's paycheck budget.
+function estimateMonthlyIncome() {
+  if (state.profile === 'joven') {
+    const sorted = state.periods.filter(p => !p.archived).slice().sort((a, b) => b.period_date.localeCompare(a.period_date));
+    if (!sorted.length) return null;
+    return sorted.slice(0, 2).reduce((s, p) => s + Number(p.salary), 0);
+  }
+  const sorted = state.justineMonths.filter(m => !m.archived).slice().sort((a, b) => b.month_date.localeCompare(a.month_date));
+  return sorted.length ? Number(sorted[0].paycheck_budget) : null;
+}
+
+function renderInstallmentsDashboard(list) {
+  const wrap = $('#install-dashboard');
+  if (!list.length) {
+    wrap.innerHTML = `<div class="section-card"><div class="empty-state">No installments yet — add one to see your dashboard.</div></div>`;
+    return;
+  }
+  const metricsList = list.map(i => ({ i, m: installmentMetrics(i) }));
+  const activeMetrics = metricsList.filter(x => !x.m.done);
+
+  const totalPrincipal = metricsList.reduce((s, x) => s + x.m.principal, 0);
+  const totalOutstanding = activeMetrics.reduce((s, x) => s + x.m.remaining, 0);
+  const totalMonthlyObligation = activeMetrics.reduce((s, x) => s + x.m.monthly, 0);
+  const totalInterest = metricsList.reduce((s, x) => s + x.m.interest, 0);
+  const totalFee = metricsList.reduce((s, x) => s + x.m.fee, 0);
+  const totalFinanceCharge = totalInterest + totalFee;
+  const costOfCredit = totalPrincipal > 0 ? (totalFinanceCharge / totalPrincipal * 100) : 0;
+  const perPlanRates = metricsList.filter(x => x.m.principal > 0).map(x => (x.m.interest + x.m.fee) / x.m.principal * 100);
+  const avgPlanRate = perPlanRates.length ? perPlanRates.reduce((a, b) => a + b, 0) / perPlanRates.length : 0;
+  const income = estimateMonthlyIncome();
+  const dti = income ? (totalMonthlyObligation / income * 100) : null;
+  const totalToPayAll = metricsList.reduce((s, x) => s + x.m.totalToPay, 0);
+  const totalPaidSoFar = metricsList.reduce((s, x) => s + (x.m.totalToPay - x.m.remaining), 0);
+  const overallPaidPct = totalToPayAll > 0 ? (totalPaidSoFar / totalToPayAll * 100) : 0;
+
+  const endDates = activeMetrics.map(x => x.m.endDate).filter(Boolean).sort();
+  const debtFreeDate = endDates.length ? endDates[endDates.length - 1] : null;
+
+  // Aggregate by bank (card), including a "General Ledger" bucket
+  const byBank = new Map();
+  metricsList.forEach(({ i, m }) => {
+    const key = m.card ? m.card.id : 'general';
+    if (!byBank.has(key)) byBank.set(key, { name: m.card ? m.card.name : 'General Ledger', color: m.card ? m.card.color : 'var(--blue)', count: 0, principal: 0, interest: 0, fee: 0 });
+    const b = byBank.get(key);
+    b.count++; b.principal += m.principal; b.interest += m.interest; b.fee += m.fee;
+  });
+  const banks = Array.from(byBank.values()).map(b => ({
+    ...b,
+    interestRate: b.principal > 0 ? (b.interest / b.principal * 100) : 0,
+    feeRate: b.principal > 0 ? (b.fee / b.principal * 100) : 0,
+  }));
+  const byUsage = [...banks].sort((a, b) => a.principal - b.principal);
+  const byInterest = [...banks].sort((a, b) => a.interestRate - b.interestRate);
+  const byFee = [...banks].sort((a, b) => a.feeRate - b.feeRate);
+
+  function rankListHtml(items, valueFn, fmt) {
+    if (!items.length) return `<div class="empty-state" style="padding:16px;font-size:13px;">No data yet.</div>`;
+    return items.map((b, idx) => `
+      <div class="rank-row">
+        <span class="rank-num">#${idx + 1}</span>
+        <span class="card-chip" style="flex:1;"><span class="sw" style="background:${b.color}"></span>${escapeHtml(b.name)}</span>
+        <span class="rank-val">${fmt(valueFn(b))}</span>
+      </div>`).join('');
+  }
+
+  // Payoff timeline - each active plan as a bar from today to its end date
+  const timelineItems = activeMetrics.filter(x => x.m.endDate).sort((a, b) => a.m.endDate.localeCompare(b.m.endDate));
+  let timelineHtml = `<div class="empty-state" style="padding:16px;font-size:13px;">Nothing active to project.</div>`;
+  if (timelineItems.length) {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const maxD = new Date(timelineItems[timelineItems.length - 1].m.endDate + 'T00:00:00');
+    const totalSpan = Math.max(maxD - today, 1);
+    timelineHtml = timelineItems.map(({ i, m }) => {
+      const end = new Date(m.endDate + 'T00:00:00');
+      const pct = Math.min(100, Math.max(3, ((end - today) / totalSpan) * 100));
+      return `
+        <div class="timeline-row">
+          <div class="timeline-label">${escapeHtml(i.name)} <span style="color:var(--text-dim);font-size:11px;">${m.card ? m.card.name : 'General Ledger'}</span></div>
+          <div class="timeline-track"><div class="timeline-fill" style="width:${pct}%;background:${m.card ? m.card.color : 'var(--blue)'}"></div></div>
+          <div class="timeline-date">${end.toLocaleDateString('en-PH', { month: 'short', year: 'numeric' })}</div>
+        </div>`;
+    }).join('');
+  }
+
+  wrap.innerHTML = `
+    <div class="dash-stats">
+      <div class="stat-card"><div class="stat-label">Active plans</div><div class="stat-value">${activeMetrics.length}</div></div>
+      <div class="stat-card"><div class="stat-label">Outstanding balance</div><div class="stat-value">${PESO(totalOutstanding)}</div></div>
+      <div class="stat-card"><div class="stat-label">Monthly obligation</div><div class="stat-value">${PESO(totalMonthlyObligation)}</div></div>
+      <div class="stat-card"><div class="stat-label">Debt-to-income</div><div class="stat-value">${dti !== null ? dti.toFixed(1) + '%' : '—'}</div><div class="stat-note">${dti !== null ? 'of latest income' : 'add a period first'}</div></div>
+      <div class="stat-card"><div class="stat-label">Avg plan rate</div><div class="stat-value">${avgPlanRate.toFixed(1)}%</div><div class="stat-note">mean across plans</div></div>
+      <div class="stat-card"><div class="stat-label">Cost of credit</div><div class="stat-value">${costOfCredit.toFixed(1)}%</div><div class="stat-note">₱-weighted overall</div></div>
+      <div class="stat-card"><div class="stat-label">Paid off so far</div><div class="stat-value">${overallPaidPct.toFixed(1)}%</div><div class="stat-note">of lifetime total</div></div>
+      <div class="stat-card"><div class="stat-label">Debt-free by</div><div class="stat-value">${debtFreeDate ? new Date(debtFreeDate + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }) : '—'}</div></div>
+    </div>
+
+    <div class="dash-rankings">
+      <div class="rank-col">
+        <h4>Bank usage <span>low → high, by principal</span></h4>
+        ${rankListHtml(byUsage, b => b.principal, PESO)}
+      </div>
+      <div class="rank-col">
+        <h4>Interest rate <span>low → high</span></h4>
+        ${rankListHtml(byInterest, b => b.interestRate, v => v.toFixed(1) + '%')}
+      </div>
+      <div class="rank-col">
+        <h4>Fee rate <span>low → high</span></h4>
+        ${rankListHtml(byFee, b => b.feeRate, v => v.toFixed(1) + '%')}
+      </div>
+    </div>
+
+    <div class="dash-timeline">
+      <h4>Payoff timeline <span>when each active plan finishes</span></h4>
+      ${timelineHtml}
+    </div>
+  `;
+}
+
 function scheduleStatus(dueDateStr) {
   const due = new Date(dueDateStr + 'T00:00:00');
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -933,18 +1068,23 @@ function renderInstallments() {
   const main = $('#main');
   const ownAll = state.installments.filter(i => i.owner === state.profile);
   const archivedList = ownAll.filter(i => i.archived);
+  const activeAll = ownAll.filter(i => !i.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;">
       <div><h2>Installments</h2><div class="subtitle">Payment plans, split by period, and when each one finishes</div></div>
       <div style="display:flex;gap:8px;">
+        <button class="btn secondary" id="toggle-dashboard">${state.showInstallDashboard ? 'Hide' : 'Show'} dashboard</button>
         ${state.showArchivedInstallments ? `<button class="btn secondary" id="toggle-archived-installments">← Back to active</button>` : archivedList.length ? `<button class="btn secondary" id="toggle-archived-installments">Show archived (${archivedList.length})</button>` : ''}
         <button class="btn" id="add-install-btn">+ New installment</button>
       </div>
     </div>
+    <div id="install-dashboard"></div>
     <div class="card-select-tabs" id="install-tabs"></div>
     <div class="install-grid" id="install-grid"></div>
   `;
   $('#add-install-btn').onclick = () => openInstallModal();
+  $('#toggle-dashboard').onclick = () => { state.showInstallDashboard = !state.showInstallDashboard; renderInstallments(); };
+  if (state.showInstallDashboard) renderInstallmentsDashboard(activeAll);
   if ($('#toggle-archived-installments')) $('#toggle-archived-installments').onclick = () => { state.showArchivedInstallments = !state.showArchivedInstallments; renderInstallments(); };
 
   const ownList = ownAll.filter(i => state.showArchivedInstallments ? i.archived : !i.archived);
