@@ -24,13 +24,16 @@ function parseStatementDay(text) {
   const m = String(text).match(/\d+/);
   return m ? parseInt(m[0], 10) : null;
 }
-function hasStatementArrived(card) {
+function hasStatementArrived(card, periodDate) {
   const day = parseStatementDay(card.statement_day);
   if (!day) return false;
-  return new Date().getDate() >= day;
+  const today = new Date();
+  const pd = new Date(periodDate + 'T00:00:00');
+  if (pd.getFullYear() !== today.getFullYear() || pd.getMonth() !== today.getMonth()) return false;
+  return today.getDate() >= day;
 }
-function statementBadge(card) {
-  if (!hasStatementArrived(card)) return '';
+function statementBadge(card, periodDate) {
+  if (!hasStatementArrived(card, periodDate)) return '';
   return ` <span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);" title="Statement day (${card.statement_day}) has passed this month">🧾 statement in</span>`;
 }
 const $ = sel => document.querySelector(sel);
@@ -436,54 +439,86 @@ function renderSummary() {
         <button class="btn" id="add-period-btn">+ New period</button>
       </div>
     </div>
-    <div class="period-grid" id="period-grid"></div>
+    <div id="period-groups"></div>
     ${state.showArchivedPeriods && archivedPeriods.length ? `<h3 style="font-family:'Space Grotesk',sans-serif;font-size:15px;margin:24px 0 12px;color:var(--text-dim);">Archived</h3><div class="period-grid" id="archived-period-grid"></div>` : ''}
   `;
-  $('#add-period-btn').onclick = () => openPeriodModal();
+  $('#add-period-btn').onclick = () => openNewMonthPeriodModal();
   if ($('#toggle-archived-periods')) $('#toggle-archived-periods').onclick = () => { state.showArchivedPeriods = !state.showArchivedPeriods; renderSummary(); };
 
-  const grid = $('#period-grid');
+  const groupsWrap = $('#period-groups');
   if (!periods.length) {
-    grid.innerHTML = `<div class="empty-state">No periods yet. Click "New period" to add your first 15th or 30th.</div>`;
+    groupsWrap.innerHTML = `<div class="empty-state">No periods yet. Click "New period" to add your first month.</div>`;
     return;
   }
+
+  // Group by calendar month, newest month first; 15th always sits left of 30th within a group.
+  const byMonth = new Map();
   periods.forEach(p => {
+    const mk = monthKey(p.period_date);
+    if (!byMonth.has(mk)) byMonth.set(mk, {});
+    byMonth.get(mk)[p.period_type] = p;
+  });
+  const monthKeys = Array.from(byMonth.keys()).sort((a, b) => b.localeCompare(a));
+
+  function periodBoxHtml(p) {
     const t = periodTotals(p);
+    return `
+      <div class="period-card period-subcard">
+        <div class="ph">
+          <div><span class="tag">${p.period_type}</span></div>
+          <div>
+            <button class="icon-btn edit" data-edit="${p.id}" title="Edit">✎</button>
+            <button class="icon-btn" data-archive="${p.id}" title="Archive">📦</button>
+          </div>
+        </div>
+        <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
+        <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
+        <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span></span><span class="val">${PESO(t.wifeyAmount)}</span></div>
+        ${incomeItemsForPeriod(p.id).map(item => `
+          <div class="line">
+            <span class="lbl">${escapeHtml(item.label)}
+              <button class="icon-btn edit" data-edit-income="${item.id}" style="width:20px;height:20px;font-size:10px;margin-left:4px;">✎</button>
+              <button class="icon-btn" data-del-income="${item.id}" style="width:20px;height:20px;font-size:10px;">✕</button>
+            </span>
+            <span class="val">${PESO(item.amount)}</span>
+          </div>`).join('')}
+        <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
+        <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(generalLedgerTotalForPeriod(p.id))}</span></div>
+        ${state.cards.map(c => {
+          const amt = cardTotalForPeriod(c.id, p.id);
+          if (!amt) return '';
+          return `<div class="line"><span class="lbl card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}${statementBadge(c, p.period_date)}</span><span class="val">${PESO(amt)}</span></div>`;
+        }).join('')}
+        <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.outflow)}</span></div>
+        <div class="line savings total"><span class="lbl">Savings</span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
+      </div>`;
+  }
+  function emptyBoxHtml(type, mk) {
+    return `
+      <div class="period-card period-subcard" style="display:flex;align-items:center;justify-content:center;min-height:140px;">
+        <button class="btn secondary" data-add-single="${mk}|${type}">+ Add ${type}</button>
+      </div>`;
+  }
+
+  monthKeys.forEach(mk => {
+    const pair = byMonth.get(mk);
+    const monthLabel = new Date(mk + '-01T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
     const el = document.createElement('div');
-    el.className = 'period-card';
+    el.className = 'period-group-card';
     el.innerHTML = `
-      <div class="ph">
-        <div>
-          <span class="tag">${p.period_type}</span>
-          <div class="date">${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>
-        </div>
-        <div>
-          <button class="icon-btn edit" data-edit="${p.id}" title="Edit">✎</button>
-          <button class="icon-btn" data-archive="${p.id}" title="Archive">📦</button>
-        </div>
+      <div class="pg-header">${monthLabel}</div>
+      <div class="period-subgrid">
+        ${pair['15th'] ? periodBoxHtml(pair['15th']) : emptyBoxHtml('15th', mk)}
+        ${pair['30th'] ? periodBoxHtml(pair['30th']) : emptyBoxHtml('30th', mk)}
       </div>
-      <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" id="eye-${p.id}" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
-      <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
-      <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span></span><span class="val">${PESO(t.wifeyAmount)}</span></div>
-      ${incomeItemsForPeriod(p.id).map(item => `
-        <div class="line">
-          <span class="lbl">${escapeHtml(item.label)}
-            <button class="icon-btn edit" data-edit-income="${item.id}" style="width:20px;height:20px;font-size:10px;margin-left:4px;">✎</button>
-            <button class="icon-btn" data-del-income="${item.id}" style="width:20px;height:20px;font-size:10px;">✕</button>
-          </span>
-          <span class="val">${PESO(item.amount)}</span>
-        </div>`).join('')}
-      <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
-      <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(generalLedgerTotalForPeriod(p.id))}</span></div>
-      ${state.cards.map(c => {
-        const amt = cardTotalForPeriod(c.id, p.id);
-        if (!amt) return '';
-        return `<div class="line"><span class="lbl card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}${statementBadge(c)}</span><span class="val">${PESO(amt)}</span></div>`;
-      }).join('')}
-      <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.outflow)}</span></div>
-      <div class="line savings total"><span class="lbl">Savings</span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
     `;
-    grid.appendChild(el);
+    groupsWrap.appendChild(el);
+  });
+
+  $$('[data-add-single]').forEach(b => b.onclick = () => {
+    const [mk, type] = b.dataset.addSingle.split('|');
+    const day = type === '15th' ? '15' : String(Math.min(30, new Date(Number(mk.slice(0, 4)), Number(mk.slice(5, 7)), 0).getDate())).padStart(2, '0');
+    openPeriodModal(null, `${mk}-${day}`, type);
   });
   $$('[data-edit]').forEach(b => b.onclick = () => openPeriodModal(periods.find(p => p.id === b.dataset.edit)));
   wireRevealToggles();
@@ -552,9 +587,41 @@ function openIncomeItemModal(item, periodId) {
   };
 }
 
-function openPeriodModal(period) {
+function openNewMonthPeriodModal() {
+  showModal(`
+    <h3>New period</h3>
+    <div class="field-row">
+      <div class="field"><label>Month</label><input type="month" id="f-month"></div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);">Creates both the 15th and 30th boxes for this month (skips any that already exist) — edit each one afterward to fill in the details.</p>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-save">Create</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const monthVal = $('#f-month').value; // "2026-08"
+    if (!monthVal) { toast('Pick a month'); return; }
+    const [y, m] = monthVal.split('-').map(Number);
+    const lastDay = new Date(y, m, 0).getDate();
+    const day30 = String(Math.min(30, lastDay)).padStart(2, '0');
+    const date15 = `${monthVal}-15`;
+    const date30 = `${monthVal}-${day30}`;
+    const has15 = state.periods.some(p => p.period_date === date15 && p.period_type === '15th');
+    const has30 = state.periods.some(p => p.period_date === date30 && p.period_type === '30th');
+    const rows = [];
+    if (!has15) rows.push({ period_date: date15, period_type: '15th', salary: 0, previous_savings: 0 });
+    if (!has30) rows.push({ period_date: date30, period_type: '30th', salary: 0, previous_savings: 0 });
+    if (!rows.length) { toast('Both periods already exist for this month'); return; }
+    const { error } = await db.from('periods').insert(rows);
+    if (error) { toast(error.message); return; }
+    closeModal(); await loadAll(); renderView();
+  };
+}
+
+function openPeriodModal(period, defaultDate, defaultType) {
   const isEdit = !!period;
-  const p = period || { period_date: '', period_type: '15th', salary: 0, previous_savings: 0, wifey: 0 };
+  const p = period || { period_date: defaultDate || '', period_type: defaultType || '15th', salary: 0, previous_savings: 0, wifey: 0 };
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} period</h3>
     <div class="field-row">
@@ -691,7 +758,7 @@ function renderTransactions() {
     sec.className = 'section-card';
     sec.innerHTML = `
       <div class="sh">
-        <h3><span class="card-chip"><span class="sw" style="background:${card.color}"></span>${card.name}${statementBadge(card)}</span></h3>
+        <h3><span class="card-chip"><span class="sw" style="background:${card.color}"></span>${card.name}${statementBadge(card, period.period_date)}</span></h3>
         <div style="display:flex;align-items:center;gap:14px;">
           <span class="total">${PESO(total)}</span>
           <button class="btn secondary" data-add="${card.id}" style="padding:6px 12px;font-size:13px;">+ Add</button>
