@@ -178,6 +178,29 @@ body{
 }
 @media(max-width:900px){.period-grid{grid-template-columns:1fr;}}
 
+/* Month group: one outer wrapper holding the 15th + 30th sub-boxes */
+.period-group-card{
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:16px;
+  margin-bottom:22px;
+  background:rgba(255,255,255,.012);
+}
+.period-group-card .pg-header{
+  font-family:'Space Grotesk',sans-serif;
+  font-weight:700;
+  font-size:16px;
+  margin-bottom:14px;
+  padding-left:2px;
+}
+.period-subgrid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:16px;
+}
+@media(max-width:900px){.period-subgrid{grid-template-columns:1fr;}}
+.period-subcard{margin:0;}
+
 .period-card{
   background:var(--surface);
   border:1px solid var(--border);
