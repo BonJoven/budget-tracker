@@ -964,10 +964,25 @@ function renderInstallmentsDashboard(list) {
   const perPlanRates = metricsList.filter(x => x.m.principal > 0).map(x => (x.m.interest + x.m.fee) / x.m.principal * 100);
   const avgPlanRate = perPlanRates.length ? perPlanRates.reduce((a, b) => a + b, 0) / perPlanRates.length : 0;
   const income = estimateMonthlyIncome();
-  const dti = income ? (totalMonthlyObligation / income * 100) : null;
   const totalToPayAll = metricsList.reduce((s, x) => s + x.m.totalToPay, 0);
   const totalPaidSoFar = metricsList.reduce((s, x) => s + (x.m.totalToPay - x.m.remaining), 0);
   const overallPaidPct = totalToPayAll > 0 ? (totalPaidSoFar / totalToPayAll * 100) : 0;
+
+  // Split with the other spouse - how much of these plans is actually theirs,
+  // not yours, based on the same per-period split used in "View schedule".
+  const counterpartLabel = state.profile === 'joven' ? 'Justine' : 'Joven';
+  const counterpartMonthly = activeMetrics.reduce((s, x) => s + Number(x.i.wifey_monthly_share || 0), 0);
+  const counterpartRemaining = metricsList.reduce((s, x) => {
+    const cpRem = x.m.schedule.filter(r => scheduleStatus(r.due_date) !== 'paid').reduce((ss, r) => ss + totalWifeyShareForRow(x.i, r), 0);
+    return s + cpRem;
+  }, 0);
+  const counterpartLifetime = metricsList.reduce((s, x) => {
+    const cpAll = x.m.schedule.reduce((ss, r) => ss + totalWifeyShareForRow(x.i, r), 0);
+    return s + cpAll;
+  }, 0);
+  const yourNetMonthly = Math.max(totalMonthlyObligation - counterpartMonthly, 0);
+  const yourNetOutstanding = Math.max(totalOutstanding - counterpartRemaining, 0);
+  const dtiNet = income ? (yourNetMonthly / income * 100) : null;
 
   const endDates = activeMetrics.map(x => x.m.endDate).filter(Boolean).sort();
   const debtFreeDate = endDates.length ? endDates[endDates.length - 1] : null;
@@ -1023,11 +1038,22 @@ function renderInstallmentsDashboard(list) {
       <div class="stat-card"><div class="stat-label">Active plans</div><div class="stat-value">${activeMetrics.length}</div></div>
       <div class="stat-card"><div class="stat-label">Outstanding balance</div><div class="stat-value">${PESO(totalOutstanding)}</div></div>
       <div class="stat-card"><div class="stat-label">Monthly obligation</div><div class="stat-value">${PESO(totalMonthlyObligation)}</div></div>
-      <div class="stat-card"><div class="stat-label">Debt-to-income</div><div class="stat-value">${dti !== null ? dti.toFixed(1) + '%' : '—'}</div><div class="stat-note">${dti !== null ? 'of latest income' : 'add a period first'}</div></div>
+      <div class="stat-card"><div class="stat-label">Debt-to-income (net)</div><div class="stat-value">${dtiNet !== null ? dtiNet.toFixed(1) + '%' : '—'}</div><div class="stat-note">${dtiNet !== null ? `net of ${counterpartLabel}'s share` : 'add a period first'}</div></div>
       <div class="stat-card"><div class="stat-label">Avg plan rate</div><div class="stat-value">${avgPlanRate.toFixed(1)}%</div><div class="stat-note">mean across plans</div></div>
       <div class="stat-card"><div class="stat-label">Cost of credit</div><div class="stat-value">${costOfCredit.toFixed(1)}%</div><div class="stat-note">₱-weighted overall</div></div>
       <div class="stat-card"><div class="stat-label">Paid off so far</div><div class="stat-value">${overallPaidPct.toFixed(1)}%</div><div class="stat-note">of lifetime total</div></div>
       <div class="stat-card"><div class="stat-label">Debt-free by</div><div class="stat-value">${debtFreeDate ? new Date(debtFreeDate + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }) : '—'}</div></div>
+    </div>
+
+    <div class="dash-timeline" style="margin-bottom:22px;">
+      <h4>Split with ${counterpartLabel} <span>how much of these plans is actually theirs, not yours</span></h4>
+      <div class="dash-stats" style="margin-bottom:0;">
+        <div class="stat-card"><div class="stat-label">Your net monthly</div><div class="stat-value">${PESO(yourNetMonthly)}</div><div class="stat-note">what you actually carry</div></div>
+        <div class="stat-card"><div class="stat-label">${counterpartLabel}'s monthly share</div><div class="stat-value">${PESO(counterpartMonthly)}</div><div class="stat-note">owed back to you each period</div></div>
+        <div class="stat-card"><div class="stat-label">Your net outstanding</div><div class="stat-value">${PESO(yourNetOutstanding)}</div></div>
+        <div class="stat-card"><div class="stat-label">${counterpartLabel} owes (remaining)</div><div class="stat-value">${PESO(counterpartRemaining)}</div></div>
+        <div class="stat-card"><div class="stat-label">${counterpartLabel}'s lifetime share</div><div class="stat-value">${PESO(counterpartLifetime)}</div><div class="stat-note">across all these plans, paid + unpaid</div></div>
+      </div>
     </div>
 
     <div class="dash-rankings">
