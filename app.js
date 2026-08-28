@@ -75,6 +75,17 @@ function toast(msg) {
 
 /* ---------------- AUTH ---------------- */
 
+const SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000; // auto-logout after 1 day since last unlock
+
+function markSessionActive() {
+  localStorage.setItem('budget_unlock_time', String(Date.now()));
+}
+function isSessionExpired() {
+  const t = localStorage.getItem('budget_unlock_time');
+  if (!t) return true; // no recorded unlock time - treat as expired, safer default
+  return (Date.now() - Number(t)) > SESSION_TIMEOUT_MS;
+}
+
 async function initAuth() {
   if (!db) {
     if (!CONFIG_OK) {
@@ -104,9 +115,14 @@ async function initAuth() {
     if (error) throw error;
     if (!data) {
       renderSetupPassword();
-    } else if (localStorage.getItem('budget_unlocked') === 'true') {
+    } else if (localStorage.getItem('budget_unlocked') === 'true' && !isSessionExpired()) {
       enterApp();
     } else {
+      if (localStorage.getItem('budget_unlocked') === 'true') {
+        // Was unlocked, but it's been over a day - force back through the password screen.
+        localStorage.removeItem('budget_unlocked');
+        localStorage.removeItem('budget_unlock_time');
+      }
       renderLogin();
     }
   } catch (e) {
@@ -139,6 +155,7 @@ function renderSetupPassword() {
     const { error } = await db.from('app_settings').insert({ key: 'password_hash', value: hash });
     if (error) { $('#login-error').textContent = error.message; return; }
     localStorage.setItem('budget_unlocked', 'true');
+    markSessionActive();
     enterApp();
   };
 }
@@ -160,6 +177,7 @@ function renderLogin() {
     const { data } = await db.from('app_settings').select('*').eq('key', 'password_hash').maybeSingle();
     if (data && data.value === hash) {
       localStorage.setItem('budget_unlocked', 'true');
+      markSessionActive();
       enterApp();
     } else {
       $('#login-error').textContent = 'Wrong password. Try again.';
@@ -169,6 +187,7 @@ function renderLogin() {
 
 function logout() {
   localStorage.removeItem('budget_unlocked');
+  localStorage.removeItem('budget_unlock_time');
   location.reload();
 }
 
@@ -181,6 +200,9 @@ async function enterApp() {
   applyProfileTheme();
   renderSidebar();
   renderView();
+  // Catches the case where the tab is simply left open across the 24h mark,
+  // rather than closed and reopened later.
+  setInterval(() => { if (isSessionExpired()) logout(); }, 5 * 60 * 1000);
 }
 
 async function loadAll() {
