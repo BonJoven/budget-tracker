@@ -34,7 +34,8 @@ function hasStatementArrived(card, periodDate) {
 }
 function statementBadge(card, periodDate) {
   if (!hasStatementArrived(card, periodDate)) return '';
-  return ` <span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);" title="Statement day (${card.statement_day}) has passed this month">🧾 statement in</span>`;
+  const dueBadge = card.due_day ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);" title="Payment due on the ${card.due_day}">📅 due ${escapeHtml(card.due_day)}</span>` : '';
+  return ` <span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);" title="Statement day (${card.statement_day}) has passed this month">🧾 statement in</span>${dueBadge}`;
 }
 const $ = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
@@ -1362,12 +1363,13 @@ function renderSettings() {
     </div>
     <div class="section-card">
       <table>
-        <thead><tr><th>Card</th><th>Statement day</th><th></th><th></th></tr></thead>
+        <thead><tr><th>Card</th><th>Statement day</th><th>Due day</th><th></th><th></th></tr></thead>
         <tbody>
           ${state.cards.map(c => `
             <tr>
               <td><span class="card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}</span>${c.archived ? ' <span style="color:var(--text-dim)">(archived)</span>' : ''}</td>
               <td>${c.statement_day || '—'}</td>
+              <td>${c.due_day || '—'}</td>
               <td style="text-align:right;">
                 <button class="icon-btn edit" data-edit-c="${c.id}">✎</button>
                 <button class="icon-btn" data-del-c="${c.id}">✕</button>
@@ -1403,7 +1405,7 @@ function renderSettings() {
 
 function openCardModal(card) {
   const isEdit = !!card;
-  const c = card || { name: '', color: '#5b9df9', statement_day: '', sort_order: state.cards.length + 1 };
+  const c = card || { name: '', color: '#5b9df9', statement_day: '', due_day: '', sort_order: state.cards.length + 1 };
   showModal(`
     <h3>${isEdit ? 'Edit' : 'Add'} card</h3>
     <div class="field-row">
@@ -1412,14 +1414,16 @@ function openCardModal(card) {
     </div>
     <div class="field-row">
       <div class="field"><label>Statement day (optional)</label><input type="text" id="f-sd" value="${c.statement_day || ''}" placeholder="e.g. 27th"></div>
+      <div class="field"><label>Due day (optional)</label><input type="text" id="f-dd" value="${c.due_day || ''}" placeholder="e.g. 15th"></div>
     </div>
+    <p style="font-size:12px;color:var(--text-dim);">Due day shows up next to the "statement in" badge once that statement has actually arrived this month.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
     </div>
   `);
   $('#modal-save').onclick = async () => {
-    const payload = { name: $('#f-name').value.trim(), color: $('#f-color').value, statement_day: $('#f-sd').value.trim() };
+    const payload = { name: $('#f-name').value.trim(), color: $('#f-color').value, statement_day: $('#f-sd').value.trim(), due_day: $('#f-dd').value.trim() };
     if (!payload.name) { toast('Name required'); return; }
     let error;
     if (isEdit) ({ error } = await db.from('credit_cards').update(payload).eq('id', c.id));
