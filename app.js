@@ -24,18 +24,42 @@ function parseStatementDay(text) {
   const m = String(text).match(/\d+/);
   return m ? parseInt(m[0], 10) : null;
 }
-function hasStatementArrived(card, periodDate) {
+
+// The statement relevant to a given period is whichever occurrence of the
+// card's statement day most recently CLOSED before that period's own date -
+// not necessarily one in the same calendar month. E.g. with a statement day
+// of the 27th, the "Sep 15" period reflects the statement that closed on
+// Aug 27 (last month), since Sep 27 hasn't happened yet by the 15th. A "30th"
+// period, on the other hand, reflects that same month's 27th, since by the
+// 30th this month's statement has already closed.
+function statementCloseDateForPeriod(card, periodDate) {
   const day = parseStatementDay(card.statement_day);
-  if (!day) return false;
-  const today = new Date();
+  if (!day) return null;
   const pd = new Date(periodDate + 'T00:00:00');
-  if (pd.getFullYear() !== today.getFullYear() || pd.getMonth() !== today.getMonth()) return false;
-  return today.getDate() >= day;
+  let candidate = new Date(pd.getFullYear(), pd.getMonth(), day);
+  if (candidate >= pd) candidate = new Date(pd.getFullYear(), pd.getMonth() - 1, day);
+  return candidate;
+}
+// The due date is the card's due day, in the month AFTER that statement closed.
+function dueDateForPeriod(card, periodDate) {
+  const closeDate = statementCloseDateForPeriod(card, periodDate);
+  const dueDay = parseStatementDay(card.due_day);
+  if (!closeDate || !dueDay) return null;
+  return new Date(closeDate.getFullYear(), closeDate.getMonth() + 1, dueDay);
+}
+function hasStatementArrived(card, periodDate) {
+  const closeDate = statementCloseDateForPeriod(card, periodDate);
+  if (!closeDate) return false;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return today >= closeDate; // once true, stays true forever - it's now a historical fact
 }
 function statementBadge(card, periodDate) {
   if (!hasStatementArrived(card, periodDate)) return '';
-  const dueBadge = card.due_day ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);" title="Payment due on the ${card.due_day}">📅 due ${escapeHtml(card.due_day)}</span>` : '';
-  return ` <span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);" title="Statement day (${card.statement_day}) has passed this month">🧾 statement in</span>${dueBadge}`;
+  const closeDate = statementCloseDateForPeriod(card, periodDate);
+  const closeLabel = closeDate.toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
+  const due = dueDateForPeriod(card, periodDate);
+  const dueBadge = due ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);" title="Due date, computed from the statement close date + due day">📅 due ${due.toLocaleDateString('en-PH', { month: 'short', day: 'numeric' })}</span>` : '';
+  return ` <span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);" title="Statement closed ${closeLabel}">🧾 statement in (${closeLabel})</span>${dueBadge}`;
 }
 const $ = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
