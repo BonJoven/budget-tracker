@@ -508,8 +508,14 @@ function renderSummary() {
   });
   const monthKeys = Array.from(byMonth.keys()).sort((a, b) => b.localeCompare(a));
 
-  function periodBoxHtml(p) {
+  function periodBoxHtml(p, pairForMonth) {
     const t = periodTotals(p);
+    let combinedJustineLine = '';
+    if (p.period_type === '15th') {
+      const p30 = pairForMonth['30th'];
+      const combined = t.wifeyAmount + (p30 ? periodTotals(p30).wifeyAmount : 0);
+      combinedJustineLine = `<div class="line"><span class="lbl">Justine total (15th + 30th) <span class="synced-badge" title="Since she pays you in one lump sum on the 15th, this shows what to expect combined">Σ combined</span></span><span class="val">${PESO(combined)}</span></div>`;
+    }
     return `
       <div class="period-card period-subcard">
         <div class="ph">
@@ -522,6 +528,7 @@ function renderSummary() {
         <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
         <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
         <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span></span><span class="val">${PESO(t.wifeyAmount)}</span></div>
+        ${combinedJustineLine}
         ${incomeItemsForPeriod(p.id).map(item => `
           <div class="line">
             <span class="lbl">${escapeHtml(item.label)}
@@ -531,7 +538,7 @@ function renderSummary() {
             <span class="val">${PESO(item.amount)}</span>
           </div>`).join('')}
         <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
-        <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(generalLedgerTotalForPeriod(p.id))}</span></div>
+        <div class="line"><span class="lbl">General ledger <span class="synced-badge" title="Only counts general-ledger installments that add to your outflow - balance adjustments with Justine don't count here, see the Justine line for those">outflow only</span></span><span class="val">${PESO(generalLedgerInstallmentTotalForPeriod(p.id))}</span></div>
         ${state.cards.map(c => {
           const amt = cardTotalForPeriod(c.id, p.id);
           if (!amt) return '';
@@ -556,8 +563,8 @@ function renderSummary() {
     el.innerHTML = `
       <div class="pg-header">${monthLabel}</div>
       <div class="period-subgrid">
-        ${pair['15th'] ? periodBoxHtml(pair['15th']) : emptyBoxHtml('15th', mk)}
-        ${pair['30th'] ? periodBoxHtml(pair['30th']) : emptyBoxHtml('30th', mk)}
+        ${pair['15th'] ? periodBoxHtml(pair['15th'], pair) : emptyBoxHtml('15th', mk)}
+        ${pair['30th'] ? periodBoxHtml(pair['30th'], pair) : emptyBoxHtml('30th', mk)}
       </div>
     `;
     groupsWrap.appendChild(el);
@@ -731,6 +738,7 @@ function renderTransactions() {
         </select>
       </div>
     </div>
+    <div class="snapshot-card" id="txn-snapshot"></div>
     <div class="section-card" id="general-ledger-section">
       <div class="sh">
         <h3>General ledger <span class="synced-badge" title="Not tied to any card">not card-specific</span></h3>
@@ -749,6 +757,29 @@ function renderTransactions() {
   const glInstallments = generalLedgerInstallmentEntriesForPeriod(period.id);
   const ledgerTotal = generalLedgerTotalForPeriod(period.id);
   $('#general-ledger-total').textContent = (ledgerTotal >= 0 ? '+' : '-') + PESO(Math.abs(ledgerTotal));
+
+  // Quick-glance snapshot: what she owes you from your cards/plans, vs. what
+  // you owe her from manual adjustments + her shared installments - so the
+  // net picture is visible without scrolling into the detailed breakdown.
+  const cardShare = state.transactions.filter(t => t.period_id === period.id).reduce((s, t) => s + Number(t.wifey_share || 0), 0)
+    + virtualEntriesForPeriod(period.id).reduce((s, e) => s + e.wifey_share, 0)
+    + glInstallments.reduce((s, e) => s + e.wifey_share, 0);
+  const adjustmentsNet = adjustments.reduce((s, a) => s + Number(a.amount), 0) + sharedEntries.reduce((s, e) => s + e.amount, 0);
+  const netTotal = cardShare + adjustmentsNet;
+  $('#txn-snapshot').innerHTML = `
+    <div class="snapshot-row">
+      <span class="snapshot-label">Justine owes you <span style="color:var(--text-dim);font-weight:400;">(from your cards & plans)</span></span>
+      <span class="snapshot-val" style="color:var(--green);">+${PESO(cardShare)}</span>
+    </div>
+    <div class="snapshot-row">
+      <span class="snapshot-label">Adjusts what Justine owes you <span style="color:var(--text-dim);font-weight:400;">(her plans you cover, cash lent/covered)</span></span>
+      <span class="snapshot-val" style="color:${adjustmentsNet < 0 ? 'var(--green)' : 'var(--text)'};">${adjustmentsNet >= 0 ? '+' : '-'}${PESO(Math.abs(adjustmentsNet))}</span>
+    </div>
+    <div class="snapshot-row snapshot-total">
+      <span class="snapshot-label">Net: ${netTotal >= 0 ? 'Justine owes you' : 'You owe Justine'}</span>
+      <span class="snapshot-val">${PESO(Math.abs(netTotal))}</span>
+    </div>
+  `;
 
   const outflowSubtotal = glInstallments.reduce((s, e) => s + e.amount, 0);
   const balanceSubtotal = adjustments.reduce((s, a) => s + Number(a.amount), 0) + sharedEntries.reduce((s, e) => s + e.amount, 0);
