@@ -476,3 +476,25 @@ tr:hover td{background:var(--surface2);}
   .timeline-row{grid-template-columns:1fr;gap:4px;}
   .timeline-date{text-align:left;}
 }
+
+/* ---------- Quick-glance snapshot (Transactions page) ---------- */
+.snapshot-card{
+  background:linear-gradient(180deg, rgba(227,177,88,.06), rgba(227,177,88,0));
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:16px 18px;
+  margin-bottom:20px;
+}
+.snapshot-row{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:8px 0;
+  border-bottom:1px dashed var(--border);
+}
+.snapshot-row:last-child{border-bottom:none;}
+.snapshot-label{font-size:13.5px;}
+.snapshot-val{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:16px;font-variant-numeric:tabular-nums;}
+.snapshot-row.snapshot-total{padding-top:10px;}
+.snapshot-row.snapshot-total .snapshot-label{font-weight:700;}
+.snapshot-row.snapshot-total .snapshot-val{font-size:19px;color:var(--gold);}
