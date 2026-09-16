@@ -83,6 +83,12 @@ let state = {
   showArchivedMonths: false,
   showArchivedInstallments: false,
   showInstallDashboard: true,
+  visionBoards: [],
+  visionBoardChecklist: [],
+  visionBoardImages: [],
+  inVisionBoard: false,
+  activeVisionBoardId: null,
+  showArchivedVisionBoards: false,
 };
 
 async function sha256(text) {
@@ -230,7 +236,7 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments, visionBoards, visionBoardChecklist, visionBoardImages] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: true }),
     db.from('transactions').select('*'),
@@ -240,6 +246,9 @@ async function loadAll() {
     db.from('justine_bills').select('*'),
     db.from('installment_schedule').select('*').order('due_date', { ascending: true }),
     db.from('wifey_adjustments').select('*'),
+    db.from('vision_boards').select('*').order('sort_order'),
+    db.from('vision_board_checklist').select('*').order('sort_order'),
+    db.from('vision_board_images').select('*').order('sort_order'),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
@@ -250,6 +259,9 @@ async function loadAll() {
   state.justineBills = justineBills.data || [];
   state.installmentSchedule = schedule.data || [];
   state.wifeyAdjustments = wifeyAdjustments.data || [];
+  state.visionBoards = visionBoards.data || [];
+  state.visionBoardChecklist = visionBoardChecklist.data || [];
+  state.visionBoardImages = visionBoardImages.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
@@ -267,30 +279,47 @@ function renderSidebar() {
   `;
   $('#sidebar').innerHTML = `
     <div class="brand"><span class="dot"></span> Household Budget</div>
+    <button class="nav-btn vision-nav-btn ${state.inVisionBoard ? 'active' : ''}" id="vision-board-nav">✨ Vision Board</button>
     <div class="profile-switch" id="profile-switch">
-      <button data-profile="joven" class="${state.profile === 'joven' ? 'active' : ''}"><span class="avatar">J</span>Joven</button>
-      <button data-profile="justine" class="${state.profile === 'justine' ? 'active' : ''}"><span class="avatar">J</span>Justine</button>
+      <button data-profile="joven" class="${!state.inVisionBoard && state.profile === 'joven' ? 'active' : ''}"><span class="avatar">J</span>Joven</button>
+      <button data-profile="justine" class="${!state.inVisionBoard && state.profile === 'justine' ? 'active' : ''}"><span class="avatar">J</span>Justine</button>
     </div>
     ${state.profile === 'joven' ? jovenNav : justineNav}
     <div class="footer"><button class="btn secondary" id="logout-btn">Log out</button></div>
   `;
+  $('#vision-board-nav').onclick = () => {
+    state.inVisionBoard = true;
+    applyProfileTheme();
+    renderSidebar();
+    renderView();
+    closeMobileSidebar();
+  };
   $$('#profile-switch button').forEach(b => b.onclick = () => {
     state.profile = b.dataset.profile;
     state.view = 'summary';
+    state.inVisionBoard = false;
     applyProfileTheme();
     renderSidebar();
     renderView();
   });
-  $$('.nav-btn').forEach(b => b.onclick = () => { state.view = b.dataset.view; renderView(); closeMobileSidebar(); });
+  $$('.nav-btn[data-view]').forEach(b => b.onclick = () => {
+    state.view = b.dataset.view;
+    state.inVisionBoard = false;
+    renderSidebar();
+    renderView();
+    closeMobileSidebar();
+  });
   $('#logout-btn').onclick = logout;
 }
 
 function applyProfileTheme() {
-  $('#app').classList.toggle('theme-justine', state.profile === 'justine');
+  $('#app').classList.toggle('theme-justine', !state.inVisionBoard && state.profile === 'justine');
+  $('#app').classList.toggle('theme-vision', state.inVisionBoard);
 }
 
 function renderView() {
-  $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === state.view));
+  $$('.nav-btn[data-view]').forEach(b => b.classList.toggle('active', !state.inVisionBoard && b.dataset.view === state.view));
+  if (state.inVisionBoard) { renderVisionBoardView(); return; }
   if (state.profile === 'justine') {
     if (state.view === 'summary') renderJustineSummary();
     else if (state.view === 'installments') renderInstallments();
@@ -1430,6 +1459,275 @@ function openInstallModal(item) {
 }
 
 /* ---------------- SETTINGS VIEW ---------------- */
+
+/* ---------------- VISION BOARD ---------------- */
+
+function checklistForBoard(boardId) {
+  return state.visionBoardChecklist.filter(c => c.board_id === boardId);
+}
+function imagesForBoard(boardId) {
+  return state.visionBoardImages.filter(i => i.board_id === boardId);
+}
+function checklistProgress(boardId) {
+  const items = checklistForBoard(boardId);
+  if (!items.length) return null;
+  const done = items.filter(c => c.done).length;
+  return { done, total: items.length, pct: Math.round((done / items.length) * 100) };
+}
+
+function resizeImageFile(file, maxDim = 1600, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = e => {
+      const img = new Image();
+      img.onerror = reject;
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) { height = Math.round(height * maxDim / width); width = maxDim; }
+          else { width = Math.round(width * maxDim / height); height = maxDim; }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function renderVisionBoardView() {
+  if (state.activeVisionBoardId && state.visionBoards.find(b => b.id === state.activeVisionBoardId && !b.archived)) {
+    renderVisionBoardDetail(state.visionBoards.find(b => b.id === state.activeVisionBoardId));
+  } else {
+    state.activeVisionBoardId = null;
+    renderVisionBoardGrid();
+  }
+}
+
+function renderVisionBoardGrid() {
+  const main = $('#main');
+  const boards = state.visionBoards.filter(b => !b.archived).slice().sort((a, b) => a.sort_order - b.sort_order);
+  const archived = state.visionBoards.filter(b => b.archived);
+  main.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div><h2>✨ Vision Board</h2><div class="subtitle">Plans, trips, goals - whatever you two are working toward</div></div>
+      <div style="display:flex;gap:8px;">
+        ${state.showArchivedVisionBoards ? `<button class="btn secondary" id="toggle-archived-vision">← Back to active</button>` : archived.length ? `<button class="btn secondary" id="toggle-archived-vision">Show archived (${archived.length})</button>` : ''}
+        <button class="btn" id="add-vision-btn">+ New vision</button>
+      </div>
+    </div>
+    <div class="vision-grid" id="vision-grid"></div>
+  `;
+  $('#add-vision-btn').onclick = () => openVisionBoardModal();
+  if ($('#toggle-archived-vision')) $('#toggle-archived-vision').onclick = () => { state.showArchivedVisionBoards = !state.showArchivedVisionBoards; renderVisionBoardGrid(); };
+
+  const grid = $('#vision-grid');
+  const list = state.showArchivedVisionBoards ? archived : boards;
+  if (!list.length) {
+    grid.innerHTML = `<div class="empty-state">${state.showArchivedVisionBoards ? 'Nothing archived.' : 'No visions yet - click "New vision" to add your first one, like "China 2027".'}</div>`;
+    return;
+  }
+  list.forEach(b => {
+    const progress = checklistProgress(b.id);
+    const imgCount = imagesForBoard(b.id).length;
+    const coverImg = imagesForBoard(b.id)[0];
+    const el = document.createElement('div');
+    el.className = 'vision-card';
+    el.innerHTML = `
+      <div class="vision-cover" style="background:${coverImg ? `url('${coverImg.data_url}') center/cover` : `linear-gradient(135deg, ${b.color}33, ${b.color}0d)`};">
+        ${!coverImg ? `<span class="vision-cover-emoji">${escapeHtml(b.emoji)}</span>` : ''}
+        ${!state.showArchivedVisionBoards ? `<button class="icon-btn" data-archive-vision="${b.id}" title="Archive" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.5);border:none;">📦</button>` : `<button class="icon-btn" data-restore-vision="${b.id}" title="Restore" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.5);border:none;">♻️</button>`}
+      </div>
+      <div class="vision-body">
+        <div class="vision-title">${escapeHtml(b.title)}</div>
+        ${b.target_date ? `<div class="vision-date">${new Date(b.target_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>` : ''}
+        <div class="vision-meta">
+          ${progress ? `<span>${progress.done}/${progress.total} done</span>` : '<span style="color:var(--text-dim);">No checklist yet</span>'}
+          ${imgCount ? `<span>📷 ${imgCount}</span>` : ''}
+        </div>
+        ${progress ? `<div class="progress-track" style="margin-top:8px;"><div class="progress-fill" style="width:${progress.pct}%;background:${b.color};"></div></div>` : ''}
+      </div>
+    `;
+    if (!state.showArchivedVisionBoards) {
+      el.onclick = e => {
+        if (e.target.closest('[data-archive-vision]')) return;
+        state.activeVisionBoardId = b.id;
+        renderView();
+      };
+    }
+    grid.appendChild(el);
+  });
+  $$('[data-archive-vision]').forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    await db.from('vision_boards').update({ archived: true }).eq('id', b.dataset.archiveVision);
+    await loadAll(); renderView();
+  });
+  $$('[data-restore-vision]').forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    await db.from('vision_boards').update({ archived: false }).eq('id', b.dataset.restoreVision);
+    await loadAll(); renderView();
+  });
+}
+
+function openVisionBoardModal(board) {
+  const isEdit = !!board;
+  const b = board || { title: '', emoji: '🎯', color: '#e3b158', target_date: '' };
+  showModal(`
+    <h3>${isEdit ? 'Edit' : 'New'} vision</h3>
+    <div class="field-row">
+      <div class="field" style="flex:0 0 90px;"><label>Emoji</label><input type="text" id="f-emoji" value="${escapeHtml(b.emoji)}" maxlength="4" style="text-align:center;font-size:20px;"></div>
+      <div class="field"><label>Title</label><input type="text" id="f-title" value="${b.title ? escapeHtml(b.title) : ''}" placeholder="e.g. China 2027"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Color</label><input type="color" id="f-color" value="${b.color}"></div>
+      <div class="field"><label>Target date (optional)</label><input type="month" id="f-date" value="${b.target_date ? b.target_date.slice(0, 7) : ''}"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-save">Save</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const title = $('#f-title').value.trim();
+    if (!title) { toast('Give it a title'); return; }
+    const dateVal = $('#f-date').value;
+    const payload = {
+      title,
+      emoji: $('#f-emoji').value.trim() || '🎯',
+      color: $('#f-color').value,
+      target_date: dateVal ? dateVal + '-01' : null,
+    };
+    let error;
+    if (isEdit) ({ error } = await db.from('vision_boards').update(payload).eq('id', b.id));
+    else ({ error } = await db.from('vision_boards').insert({ ...payload, sort_order: state.visionBoards.length }));
+    if (error) { toast(error.message); return; }
+    closeModal(); await loadAll(); renderView();
+  };
+}
+
+function renderVisionBoardDetail(b) {
+  const main = $('#main');
+  const checklist = checklistForBoard(b.id).slice().sort((x, y) => x.sort_order - y.sort_order);
+  const images = imagesForBoard(b.id).slice().sort((x, y) => x.sort_order - y.sort_order);
+  const progress = checklistProgress(b.id);
+
+  main.innerHTML = `
+    <button class="btn secondary" id="vision-back-btn" style="margin-bottom:16px;">← All visions</button>
+    <div class="vision-hero" style="background:linear-gradient(135deg, ${b.color}2e, transparent);border-color:${b.color}55;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <div style="font-size:40px;line-height:1;">${escapeHtml(b.emoji)}</div>
+          <h2 style="margin:10px 0 4px 0;">${escapeHtml(b.title)}</h2>
+          ${b.target_date ? `<div class="subtitle">Target: ${new Date(b.target_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>` : ''}
+        </div>
+        <div>
+          <button class="icon-btn edit" id="edit-vision-btn" title="Edit">✎</button>
+          <button class="icon-btn" id="archive-vision-detail-btn" title="Archive">📦</button>
+        </div>
+      </div>
+      ${progress ? `<div class="progress-track" style="margin-top:16px;height:8px;"><div class="progress-fill" style="width:${progress.pct}%;background:${b.color};"></div></div><div style="font-size:12px;color:var(--text-dim);margin-top:6px;">${progress.done} of ${progress.total} done</div>` : ''}
+    </div>
+
+    <div class="section-card">
+      <h3 style="font-family:'Space Grotesk',sans-serif;margin-top:0;">Notes & Plans</h3>
+      <textarea id="vision-notes" placeholder="Write out the plan - flights, budget, itinerary, ideas, anything…" style="width:100%;min-height:140px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:12px;border-radius:8px;font-family:inherit;font-size:14px;resize:vertical;">${b.notes ? escapeHtml(b.notes) : ''}</textarea>
+    </div>
+
+    <div class="section-card">
+      <div class="sh"><h3>Checklist</h3></div>
+      <div id="vision-checklist"></div>
+      <div class="field-row" style="margin-top:10px;">
+        <input type="text" id="vision-new-item" placeholder="Add a to-do and press Enter…" style="flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 12px;border-radius:8px;font-family:inherit;font-size:14px;">
+      </div>
+    </div>
+
+    <div class="section-card">
+      <div class="sh"><h3>Photos</h3><button class="btn secondary" id="vision-add-photos-btn" style="padding:6px 12px;font-size:13px;">+ Add photos</button></div>
+      <input type="file" id="vision-photo-input" accept="image/*" multiple style="display:none;">
+      <div class="vision-photo-grid" id="vision-photo-grid"></div>
+    </div>
+  `;
+
+  $('#vision-back-btn').onclick = () => { state.activeVisionBoardId = null; renderView(); };
+  $('#edit-vision-btn').onclick = () => openVisionBoardModal(b);
+  $('#archive-vision-detail-btn').onclick = async () => {
+    await db.from('vision_boards').update({ archived: true }).eq('id', b.id);
+    state.activeVisionBoardId = null;
+    await loadAll(); renderView();
+  };
+
+  $('#vision-notes').onblur = async e => {
+    await db.from('vision_boards').update({ notes: e.target.value }).eq('id', b.id);
+    b.notes = e.target.value;
+  };
+
+  const checklistWrap = $('#vision-checklist');
+  checklistWrap.innerHTML = checklist.length ? checklist.map(c => `
+    <div class="vision-checklist-row">
+      <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer;">
+        <input type="checkbox" data-toggle-item="${c.id}" ${c.done ? 'checked' : ''} style="width:17px;height:17px;accent-color:${b.color};">
+        <span style="${c.done ? 'text-decoration:line-through;color:var(--text-dim);' : ''}">${escapeHtml(c.label)}</span>
+      </label>
+      <button class="icon-btn" data-del-item="${c.id}">✕</button>
+    </div>
+  `).join('') : `<div class="empty-state" style="padding:14px;font-size:13px;">Nothing on the list yet.</div>`;
+  $$('[data-toggle-item]').forEach(cb => cb.onchange = async () => {
+    await db.from('vision_board_checklist').update({ done: cb.checked }).eq('id', cb.dataset.toggleItem);
+    const item = state.visionBoardChecklist.find(x => x.id === cb.dataset.toggleItem);
+    if (item) item.done = cb.checked;
+    renderVisionBoardDetail(b);
+  });
+  $$('[data-del-item]').forEach(x => x.onclick = async () => {
+    await db.from('vision_board_checklist').delete().eq('id', x.dataset.delItem);
+    await loadAll(); renderView();
+  });
+  $('#vision-new-item').onkeydown = async e => {
+    if (e.key !== 'Enter') return;
+    const label = e.target.value.trim();
+    if (!label) return;
+    await db.from('vision_board_checklist').insert({ board_id: b.id, label, sort_order: checklist.length });
+    await loadAll(); renderView();
+  };
+
+  const photoGrid = $('#vision-photo-grid');
+  photoGrid.innerHTML = images.length ? images.map(img => `
+    <div class="vision-photo-thumb" data-view-photo="${img.id}" style="background-image:url('${img.data_url}');"></div>
+  `).join('') : `<div class="empty-state" style="padding:14px;font-size:13px;">No photos yet.</div>`;
+  $$('[data-view-photo]').forEach(el => el.onclick = () => openPhotoViewer(images.find(i => i.id === el.dataset.viewPhoto)));
+  $('#vision-add-photos-btn').onclick = () => $('#vision-photo-input').click();
+  $('#vision-photo-input').onchange = async e => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    toast('Uploading…');
+    for (let idx = 0; idx < files.length; idx++) {
+      try {
+        const dataUrl = await resizeImageFile(files[idx]);
+        await db.from('vision_board_images').insert({ board_id: b.id, data_url: dataUrl, sort_order: images.length + idx });
+      } catch (err) { toast('One image failed to process'); }
+    }
+    await loadAll(); renderView();
+  };
+}
+
+function openPhotoViewer(img) {
+  if (!img) return;
+  showModal(`
+    <img src="${img.data_url}" style="width:100%;border-radius:8px;display:block;">
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Close</button>
+      <button class="btn danger" id="delete-photo-btn">Delete photo</button>
+    </div>
+  `);
+  $('#delete-photo-btn').onclick = async () => {
+    if (!confirm('Delete this photo?')) return;
+    await db.from('vision_board_images').delete().eq('id', img.id);
+    closeModal(); await loadAll(); renderView();
+  };
+}
 
 function renderSettings() {
   const main = $('#main');
