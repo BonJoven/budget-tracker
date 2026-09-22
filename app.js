@@ -767,15 +767,16 @@ function renderTransactions() {
         </select>
       </div>
     </div>
-    <div class="snapshot-card" id="txn-snapshot"></div>
+    <div class="snapshot-card" id="txn-snapshot">
+      <div class="snapshot-heading">Justine Summary</div>
+    </div>
     <div class="section-card" id="general-ledger-section">
       <div class="sh">
         <h3>General ledger <span class="synced-badge" title="Not tied to any card">not card-specific</span></h3>
         <span class="total" id="general-ledger-total"></span>
       </div>
-      <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">Split into two groups below: real spending that adds to what you owe, and adjustments to what Justine owes you.</p>
+      <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">Your own installments assigned to General Ledger instead of a card - these add straight to your outflow. (Everything Justine-related now lives in the Justine Summary above.)</p>
       <div id="gl-outflow-group" style="margin-top:14px;"></div>
-      <div id="gl-balance-group" style="margin-top:18px;"></div>
     </div>
     <div id="card-sections"></div>
   `;
@@ -784,42 +785,74 @@ function renderTransactions() {
   const adjustments = state.wifeyAdjustments.filter(a => a.period_id === period.id);
   const sharedEntries = justineSharedLedgerEntriesForPeriod(period.id);
   const glInstallments = generalLedgerInstallmentEntriesForPeriod(period.id);
-  const ledgerTotal = generalLedgerTotalForPeriod(period.id);
-  $('#general-ledger-total').textContent = (ledgerTotal >= 0 ? '+' : '-') + PESO(Math.abs(ledgerTotal));
+  const outflowSubtotal = glInstallments.reduce((s, e) => s + e.amount, 0);
+  $('#general-ledger-total').textContent = PESO(outflowSubtotal);
 
-  // Quick-glance snapshot: what she owes you from your cards/plans, vs. what
-  // you owe her from manual adjustments + her shared installments - so the
-  // net picture is visible without scrolling into the detailed breakdown.
+  // Justine Summary: one place with everything about what she owes you -
+  // her share from your cards/plans, and every adjustment (her installments
+  // you cover, cash lent/covered), itemized right here so there's nothing
+  // to hunt for elsewhere.
   const cardShare = state.transactions.filter(t => t.period_id === period.id).reduce((s, t) => s + Number(t.wifey_share || 0), 0)
     + virtualEntriesForPeriod(period.id).reduce((s, e) => s + e.wifey_share, 0)
     + glInstallments.reduce((s, e) => s + e.wifey_share, 0);
   const adjustmentsNet = adjustments.reduce((s, a) => s + Number(a.amount), 0) + sharedEntries.reduce((s, e) => s + e.amount, 0);
   const netTotal = cardShare + adjustmentsNet;
+
   $('#txn-snapshot').innerHTML = `
+    <div class="snapshot-heading">Justine Summary</div>
     <div class="snapshot-row">
       <span class="snapshot-label">Justine owes you <span style="color:var(--text-dim);font-weight:400;">(from your cards & plans)</span></span>
       <span class="snapshot-val" style="color:var(--green);">+${PESO(cardShare)}</span>
     </div>
-    <div class="snapshot-row">
-      <span class="snapshot-label">Adjusts what Justine owes you <span style="color:var(--text-dim);font-weight:400;">(her plans you cover, cash lent/covered)</span></span>
-      <span class="snapshot-val" style="color:${adjustmentsNet < 0 ? 'var(--green)' : 'var(--text)'};">${adjustmentsNet >= 0 ? '+' : '-'}${PESO(Math.abs(adjustmentsNet))}</span>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;margin-bottom:4px;">
+      <span class="snapshot-label" style="font-weight:700;">You owe Justine <span style="color:var(--text-dim);font-weight:400;">(her plans you cover, cash lent/covered)</span></span>
+      <button class="btn secondary" id="add-adjustment-btn" style="padding:5px 10px;font-size:12px;">+ Add</button>
+    </div>
+    ${(sharedEntries.length || adjustments.length) ? `<table>
+      <tbody>
+        ${sharedEntries.map(e => `
+          <tr>
+            <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From Justine's installment schedule - Joven's share on this plan. Click to edit.">⇄ her plan, you cover</button></td>
+            <td class="num" style="color:var(--text);">${PESO(Math.abs(e.amount))}</td>
+            <td></td>
+          </tr>`).join('')}
+        ${adjustments.map(a => `
+          <tr>
+            <td>${escapeHtml(a.description)}</td>
+            <td class="num">${PESO(Math.abs(a.amount))} <span style="color:var(--text-dim);font-size:11px;">${Number(a.amount) >= 0 ? '(she owes more)' : '(reduces it)'}</span></td>
+            <td style="text-align:right;white-space:nowrap;">
+              <button class="icon-btn edit" data-edit-adj="${a.id}">✎</button>
+              <button class="icon-btn" data-del-adj="${a.id}">✕</button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : `<div class="empty-state" style="padding:10px 0;font-size:13px;">Nothing here yet.</div>`}
+    <div class="snapshot-row" style="margin-top:6px;">
+      <span class="snapshot-label">Subtotal you owe Justine</span>
+      <span class="snapshot-val" style="font-size:14px;">${PESO(Math.abs(adjustmentsNet))}</span>
     </div>
     <div class="snapshot-row snapshot-total">
       <span class="snapshot-label">Net: ${netTotal >= 0 ? 'Justine owes you' : 'You owe Justine'}</span>
       <span class="snapshot-val">${PESO(Math.abs(netTotal))}</span>
     </div>
   `;
-
-  const outflowSubtotal = glInstallments.reduce((s, e) => s + e.amount, 0);
-  const balanceSubtotal = adjustments.reduce((s, a) => s + Number(a.amount), 0) + sharedEntries.reduce((s, e) => s + e.amount, 0);
+  $('#add-adjustment-btn').onclick = () => openAdjustmentModal(null, period.id);
+  $$('#txn-snapshot [data-edit-adj]').forEach(b => b.onclick = () => {
+    const a = state.wifeyAdjustments.find(x => x.id === b.dataset.editAdj);
+    openAdjustmentModal(a, a.period_id);
+  });
+  $$('#txn-snapshot [data-del-adj]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this entry?')) return;
+    await db.from('wifey_adjustments').delete().eq('id', b.dataset.delAdj);
+    await loadAll(); renderView();
+  });
+  $$('#txn-snapshot [data-edit-inst-sched]').forEach(b => b.onclick = () => {
+    const inst = state.installments.find(x => x.id === b.dataset.editInstSched);
+    openScheduleModal(inst);
+  });
 
   const outflowGroup = $('#gl-outflow-group');
-  outflowGroup.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <span style="font-size:12px;font-weight:700;color:var(--red);text-transform:uppercase;letter-spacing:.4px;">Adds to your outflow</span>
-      <span style="font-size:12px;color:var(--text-dim);">Subtotal: <b style="color:var(--text);">${PESO(outflowSubtotal)}</b> → feeds Total Outflow</span>
-    </div>
-    ${glInstallments.length ? `<table>
+  outflowGroup.innerHTML = glInstallments.length ? `<table>
       <tbody>
         ${glInstallments.map(e => `
           <tr>
@@ -827,49 +860,8 @@ function renderTransactions() {
             <td class="num">${PESO(e.amount)}</td>
           </tr>`).join('')}
       </tbody>
-    </table>` : `<div class="empty-state" style="padding:14px;font-size:13px;">Nothing here — installments assigned to General Ledger show up in this group.</div>`}
-  `;
-
-  const balanceGroup = $('#gl-balance-group');
-  balanceGroup.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <span style="font-size:12px;font-weight:700;color:var(--green);text-transform:uppercase;letter-spacing:.4px;">Adjusts what Justine owes you</span>
-      <div style="display:flex;align-items:center;gap:10px;">
-        <span style="font-size:12px;color:var(--text-dim);">Subtotal: <b style="color:var(--text);">${(balanceSubtotal >= 0 ? '+' : '-') + PESO(Math.abs(balanceSubtotal))}</b> → feeds the Justine line</span>
-        <button class="btn secondary" id="add-adjustment-btn" style="padding:6px 12px;font-size:13px;">+ Add</button>
-      </div>
-    </div>
-    ${(sharedEntries.length || adjustments.length) ? `<table>
-      <tbody>
-        ${sharedEntries.map(e => `
-          <tr>
-            <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From Justine's installment schedule - Joven's share on this plan. Click to edit.">⇄ adjusts balance</button></td>
-            <td class="num" style="color:var(--green);">-${PESO(Math.abs(e.amount))}</td>
-            <td></td>
-          </tr>`).join('')}
-        ${adjustments.map(a => `
-          <tr>
-            <td>${escapeHtml(a.description)}</td>
-            <td class="num" style="color:${Number(a.amount) < 0 ? 'var(--green)' : 'var(--text)'};">${Number(a.amount) >= 0 ? '+' : '-'}${PESO(Math.abs(a.amount))}</td>
-            <td style="text-align:right;white-space:nowrap;">
-              <button class="icon-btn edit" data-edit-adj="${a.id}">✎</button>
-              <button class="icon-btn" data-del-adj="${a.id}">✕</button>
-            </td>
-          </tr>`).join('')}
-      </tbody>
-    </table>` : `<div class="empty-state" style="padding:14px;font-size:13px;">Nothing here yet.</div>`}
-  `;
-  $('#add-adjustment-btn').onclick = () => openAdjustmentModal(null, period.id);
-  $$('[data-edit-adj]').forEach(b => b.onclick = () => {
-    const a = state.wifeyAdjustments.find(x => x.id === b.dataset.editAdj);
-    openAdjustmentModal(a, a.period_id);
-  });
-  $$('[data-del-adj]').forEach(b => b.onclick = async () => {
-    if (!confirm('Delete this entry?')) return;
-    await db.from('wifey_adjustments').delete().eq('id', b.dataset.delAdj);
-    await loadAll(); renderView();
-  });
-  $$('#gl-outflow-group [data-edit-inst-sched], #gl-balance-group [data-edit-inst-sched]').forEach(b => b.onclick = () => {
+    </table>` : `<div class="empty-state" style="padding:14px;font-size:13px;">Nothing here — installments assigned to General Ledger show up in this group.</div>`;
+  $$('#gl-outflow-group [data-edit-inst-sched]').forEach(b => b.onclick = () => {
     const inst = state.installments.find(x => x.id === b.dataset.editInstSched);
     openScheduleModal(inst);
   });
