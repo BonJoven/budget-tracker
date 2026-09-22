@@ -540,10 +540,10 @@ function renderSummary() {
   function periodBoxHtml(p, pairForMonth) {
     const t = periodTotals(p);
     let combinedJustineLine = '';
-    if (p.period_type === '15th') {
-      const p30 = pairForMonth['30th'];
-      const combined = t.wifeyAmount + (p30 ? periodTotals(p30).wifeyAmount : 0);
-      combinedJustineLine = `<div class="line"><span class="lbl">Justine total (15th + 30th) <span class="synced-badge" title="Since she pays you in one lump sum on the 15th, this shows what to expect combined">Σ combined</span></span><span class="val">${PESO(combined)}</span></div>`;
+    if (p.period_type === '30th') {
+      const p15 = pairForMonth['15th'];
+      const combined = t.wifeyAmount + (p15 ? periodTotals(p15).wifeyAmount : 0);
+      combinedJustineLine = `<div class="line"><span class="lbl">Justine total (15th + 30th) <span class="synced-badge" title="Since she pays you in one lump sum on the 30th, this shows what to expect combined">Σ combined</span></span><span class="val">${PESO(combined)}</span></div>`;
     }
     return `
       <div class="period-card period-subcard">
@@ -788,52 +788,77 @@ function renderTransactions() {
   const outflowSubtotal = glInstallments.reduce((s, e) => s + e.amount, 0);
   $('#general-ledger-total').textContent = PESO(outflowSubtotal);
 
-  // Justine Summary: one place with everything about what she owes you -
-  // her share from your cards/plans, and every adjustment (her installments
-  // you cover, cash lent/covered), itemized right here so there's nothing
-  // to hunt for elsewhere.
-  const cardShare = state.transactions.filter(t => t.period_id === period.id).reduce((s, t) => s + Number(t.wifey_share || 0), 0)
-    + virtualEntriesForPeriod(period.id).reduce((s, e) => s + e.wifey_share, 0)
-    + glInstallments.reduce((s, e) => s + e.wifey_share, 0);
-  const adjustmentsNet = adjustments.reduce((s, a) => s + Number(a.amount), 0) + sharedEntries.reduce((s, e) => s + e.amount, 0);
-  const netTotal = cardShare + adjustmentsNet;
+  // One unified list: what she owes you, broken down by card, then other
+  // sources, then what you owe her (subtracted at the end) - each row
+  // tagged with its type so the whole picture reads in a single glance.
+  const perCardShare = state.cards.map(c => {
+    const real = state.transactions.filter(t => t.period_id === period.id && t.card_id === c.id).reduce((s, t) => s + Number(t.wifey_share || 0), 0);
+    const virt = virtualEntriesForPeriod(period.id).filter(e => e.card_id === c.id).reduce((s, e) => s + e.wifey_share, 0);
+    return { card: c, amount: real + virt };
+  }).filter(x => x.amount !== 0);
+  const otherOwed = [
+    ...glInstallments.filter(e => e.wifey_share !== 0).map(e => ({ description: e.description, amount: e.wifey_share })),
+    ...adjustments.filter(a => Number(a.amount) >= 0).map(a => ({ description: a.description, amount: Number(a.amount), id: a.id, editable: true })),
+  ];
+  const youCover = [
+    ...sharedEntries.map(e => ({ description: e.description, amount: Math.abs(e.amount), installmentId: e.installmentId })),
+    ...adjustments.filter(a => Number(a.amount) < 0).map(a => ({ description: a.description, amount: Math.abs(Number(a.amount)), id: a.id, editable: true })),
+  ];
+  const cardShare = perCardShare.reduce((s, x) => s + x.amount, 0);
+  const otherShare = otherOwed.reduce((s, x) => s + x.amount, 0);
+  const owedTotal = cardShare + otherShare;
+  const coverTotal = youCover.reduce((s, x) => s + x.amount, 0);
+  const netTotal = owedTotal - coverTotal;
+
+  function editButtons(row) {
+    if (row.installmentId) return `<button class="synced-badge" data-edit-inst-sched="${row.installmentId}" style="border:none;cursor:pointer;" title="From an installment schedule - click to edit this period's split">⇄ edit split</button>`;
+    if (row.editable) return `<button class="icon-btn edit" data-edit-adj="${row.id}">✎</button><button class="icon-btn" data-del-adj="${row.id}">✕</button>`;
+    return '';
+  }
 
   $('#txn-snapshot').innerHTML = `
     <div class="snapshot-heading">Justine Summary</div>
-    <div class="snapshot-row">
-      <span class="snapshot-label">Justine owes you <span style="color:var(--text-dim);font-weight:400;">(from your cards & plans)</span></span>
-      <span class="snapshot-val" style="color:var(--green);">+${PESO(cardShare)}</span>
-    </div>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;margin-bottom:4px;">
-      <span class="snapshot-label" style="font-weight:700;">You owe Justine <span style="color:var(--text-dim);font-weight:400;">(her plans you cover, cash lent/covered)</span></span>
-      <button class="btn secondary" id="add-adjustment-btn" style="padding:5px 10px;font-size:12px;">+ Add</button>
-    </div>
-    ${(sharedEntries.length || adjustments.length) ? `<table>
+    <table>
+      <thead><tr><th>Description</th><th>Type</th><th class="num">Amount</th><th></th></tr></thead>
       <tbody>
-        ${sharedEntries.map(e => `
+        ${perCardShare.map(x => `
           <tr>
-            <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From Justine's installment schedule - Joven's share on this plan. Click to edit.">⇄ her plan, you cover</button></td>
-            <td class="num" style="color:var(--text);">${PESO(Math.abs(e.amount))}</td>
+            <td>${escapeHtml(x.card.name)}</td>
+            <td><span class="card-chip"><span class="sw" style="background:${x.card.color}"></span>Card</span></td>
+            <td class="num" style="color:var(--green);">+${PESO(x.amount)}</td>
             <td></td>
           </tr>`).join('')}
-        ${adjustments.map(a => `
+        ${otherOwed.map(x => `
           <tr>
-            <td>${escapeHtml(a.description)}</td>
-            <td class="num" style="color:${Number(a.amount) < 0 ? 'var(--text)' : 'var(--green)'};">${Number(a.amount) < 0 ? PESO(Math.abs(a.amount)) : `+${PESO(a.amount)} (adds to what she owes instead)`}</td>
-            <td style="text-align:right;white-space:nowrap;">
-              <button class="icon-btn edit" data-edit-adj="${a.id}">✎</button>
-              <button class="icon-btn" data-del-adj="${a.id}">✕</button>
-            </td>
+            <td>${escapeHtml(x.description)}</td>
+            <td><span class="synced-badge">Other</span></td>
+            <td class="num" style="color:var(--green);">+${PESO(x.amount)}</td>
+            <td style="text-align:right;white-space:nowrap;">${editButtons(x)}</td>
           </tr>`).join('')}
+        ${youCover.map(x => `
+          <tr>
+            <td>${escapeHtml(x.description)}</td>
+            <td><span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);">Plan you cover</span></td>
+            <td class="num">-${PESO(x.amount)}</td>
+            <td style="text-align:right;white-space:nowrap;">${editButtons(x)}</td>
+          </tr>`).join('')}
+        ${(!perCardShare.length && !otherOwed.length && !youCover.length) ? `<tr><td colspan="4"><div class="empty-state" style="padding:10px 0;font-size:13px;">Nothing here yet.</div></td></tr>` : ''}
       </tbody>
-    </table>` : `<div class="empty-state" style="padding:10px 0;font-size:13px;">Nothing here yet.</div>`}
-    <div class="snapshot-row" style="margin-top:6px;">
-      <span class="snapshot-label">− You owe Justine (net)</span>
-      <span class="snapshot-val" style="font-size:14px;">${PESO(Math.abs(adjustmentsNet))}</span>
+    </table>
+    <div class="snapshot-row" style="margin-top:10px;">
+      <span class="snapshot-label">Justine owes you</span>
+      <span class="snapshot-val" style="font-size:14px;color:var(--green);">+${PESO(owedTotal)}</span>
+    </div>
+    <div class="snapshot-row">
+      <span class="snapshot-label">− You owe Justine</span>
+      <span class="snapshot-val" style="font-size:14px;">${PESO(coverTotal)}</span>
     </div>
     <div class="snapshot-row snapshot-total" style="margin-top:6px;">
       <span class="snapshot-label">Net: ${netTotal >= 0 ? 'Justine owes you' : 'You owe Justine'}</span>
       <span class="snapshot-val">${PESO(Math.abs(netTotal))}</span>
+    </div>
+    <div style="text-align:right;margin-top:10px;">
+      <button class="btn secondary" id="add-adjustment-btn" style="padding:6px 12px;font-size:13px;">+ Add cash lent/covered</button>
     </div>
   `;
   $('#add-adjustment-btn').onclick = () => openAdjustmentModal(null, period.id);
