@@ -819,7 +819,7 @@ function renderTransactions() {
         ${adjustments.map(a => `
           <tr>
             <td>${escapeHtml(a.description)}</td>
-            <td class="num">${PESO(Math.abs(a.amount))} <span style="color:var(--text-dim);font-size:11px;">${Number(a.amount) >= 0 ? '(she owes more)' : '(reduces it)'}</span></td>
+            <td class="num" style="color:${Number(a.amount) < 0 ? 'var(--text)' : 'var(--green)'};">${Number(a.amount) < 0 ? PESO(Math.abs(a.amount)) : `+${PESO(a.amount)} (adds to what she owes instead)`}</td>
             <td style="text-align:right;white-space:nowrap;">
               <button class="icon-btn edit" data-edit-adj="${a.id}">✎</button>
               <button class="icon-btn" data-del-adj="${a.id}">✕</button>
@@ -828,10 +828,10 @@ function renderTransactions() {
       </tbody>
     </table>` : `<div class="empty-state" style="padding:10px 0;font-size:13px;">Nothing here yet.</div>`}
     <div class="snapshot-row" style="margin-top:6px;">
-      <span class="snapshot-label">Subtotal you owe Justine</span>
+      <span class="snapshot-label">− You owe Justine (net)</span>
       <span class="snapshot-val" style="font-size:14px;">${PESO(Math.abs(adjustmentsNet))}</span>
     </div>
-    <div class="snapshot-row snapshot-total">
+    <div class="snapshot-row snapshot-total" style="margin-top:6px;">
       <span class="snapshot-label">Net: ${netTotal >= 0 ? 'Justine owes you' : 'You owe Justine'}</span>
       <span class="snapshot-val">${PESO(Math.abs(netTotal))}</span>
     </div>
