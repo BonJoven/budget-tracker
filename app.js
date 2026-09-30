@@ -572,12 +572,19 @@ function wifeyTotalForPeriod(periodId) {
 
 function periodTotals(period) {
   const cardTotal = state.cards.reduce((s, c) => s + cardTotalForPeriod(c.id, period.id), 0);
-  const wifeyAmount = wifeyTotalForPeriod(period.id);
+  const wifeyAmount = wifeyTotalForPeriod(period.id);   // what she owes from THIS period's charges
+  // Justine settles once a month, on the 30th. So the 15th's share is tracked
+  // but never counted in the 15th's savings - the 30th counts both halves.
+  let wifeyCounted = 0;
+  if (period.period_type === '30th') {
+    const p15 = state.periods.find(p => p.period_type === '15th' && monthKey(p.period_date) === monthKey(period.period_date));
+    wifeyCounted = wifeyAmount + (p15 ? wifeyTotalForPeriod(p15.id) : 0);
+  }
   const extraIncome = incomeItemsForPeriod(period.id).reduce((s, i) => s + Number(i.amount), 0);
-  const income = Number(period.salary) + Number(period.previous_savings) + wifeyAmount + extraIncome;
+  const income = Number(period.salary) + Number(period.previous_savings) + wifeyCounted + extraIncome;
   const outflow = cardTotal + generalLedgerInstallmentTotalForPeriod(period.id);
   const savings = income - outflow;
-  return { cardTotal, income, outflow, savings, extraIncome, wifeyAmount };
+  return { cardTotal, income, outflow, savings, extraIncome, wifeyAmount, wifeyCounted };
 }
 
 /* ---------------- SUMMARY VIEW ---------------- */
@@ -619,9 +626,7 @@ function renderSummary() {
     const t = periodTotals(p);
     let combinedJustineLine = '';
     if (p.period_type === '30th') {
-      const p15 = pairForMonth['15th'];
-      const combined = t.wifeyAmount + (p15 ? periodTotals(p15).wifeyAmount : 0);
-      combinedJustineLine = `<div class="line"><span class="lbl">Justine total (15th + 30th) <span class="synced-badge" title="Since she pays you in one lump sum on the 30th, this shows what to expect combined">Σ combined</span></span><span class="val">${PESO(combined)}</span></div>`;
+      combinedJustineLine = `<div class="line"><span class="lbl">Justine total (15th + 30th) <span class="synced-badge" style="color:var(--green);background:rgba(79,216,151,.14);" title="She pays you in one lump sum on the 30th, so this combined amount is what's added to this period's savings">✓ counted in savings</span></span><span class="val">${PESO(t.wifeyCounted)}</span></div>`;
     }
     return `
       <div class="period-card period-subcard">
@@ -634,7 +639,7 @@ function renderSummary() {
         </div>
         <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
         <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
-        <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span></span><span class="val">${PESO(t.wifeyAmount)}</span></div>
+        <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span>${p.period_type === '15th' ? `<span class="synced-badge" style="color:var(--text-dim);background:rgba(141,149,171,.14);" title="She pays on the 30th, so this is shown for reference only - it's added to the 30th's savings instead">not counted · paid on 30th</span>` : ''}</span><span class="val"${p.period_type === '15th' ? ' style="color:var(--text-dim);font-weight:400;"' : ''}>${PESO(t.wifeyAmount)}</span></div>
         ${combinedJustineLine}
         ${incomeItemsForPeriod(p.id).map(item => `
           <div class="line">
