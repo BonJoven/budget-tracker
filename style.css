@@ -477,6 +477,40 @@ tr:hover td{background:var(--surface2);}
   .timeline-date{text-align:left;}
 }
 
+/* Payoff timeline, grouped by the month each plan finishes */
+.payoff-start{font-size:12.5px;color:var(--text-dim);margin-bottom:6px;}
+.payoff-start b{color:var(--text);font-variant-numeric:tabular-nums;}
+.payoff-month{
+  display:grid;
+  grid-template-columns:96px 1fr 190px;
+  gap:14px;
+  align-items:center;
+  padding:12px 0;
+  border-top:1px solid var(--border);
+}
+.payoff-mon{font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;}
+.payoff-away{font-size:11px;color:var(--text-dim);margin-top:2px;}
+.payoff-plans{display:flex;flex-wrap:wrap;gap:6px;}
+.payoff-chip{
+  display:inline-flex;align-items:center;gap:6px;
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:99px;padding:4px 10px;font-size:12px;white-space:nowrap;
+}
+.payoff-chip .sw{width:8px;height:8px;border-radius:50%;flex:none;}
+.payoff-chip-name{font-weight:600;}
+.payoff-chip-bank{color:var(--text-dim);font-size:11px;}
+.payoff-chip-amt{font-variant-numeric:tabular-nums;color:var(--text-dim);font-size:11px;border-left:1px solid var(--border);padding-left:6px;}
+.payoff-impact{text-align:right;}
+.payoff-freed{font-size:12.5px;font-weight:700;color:var(--green);font-variant-numeric:tabular-nums;}
+.payoff-track{background:var(--border);height:6px;border-radius:99px;overflow:hidden;margin:5px 0 4px;}
+.payoff-fill{height:100%;border-radius:99px;background:var(--gold);}
+.payoff-left{font-size:11px;color:var(--text-dim);font-variant-numeric:tabular-nums;}
+.payoff-last .payoff-left{color:var(--green);font-weight:700;}
+@media(max-width:700px){
+  .payoff-month{grid-template-columns:1fr;gap:8px;}
+  .payoff-impact{text-align:left;}
+}
+
 /* ---------- Quick-glance snapshot (Transactions page) ---------- */
 .snapshot-card{
   background:linear-gradient(180deg, rgba(227,177,88,.06), rgba(227,177,88,0));
