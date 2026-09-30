@@ -82,7 +82,9 @@ let state = {
   showArchivedPeriods: false,
   showArchivedMonths: false,
   showArchivedInstallments: false,
-  showInstallDashboard: true,
+  showInstallDashboard: pref('show_install_dash', true),
+  expandedMonths: new Set(),   // older months on the Summary that were expanded by hand
+  quickFocusCardId: null,      // card whose quick-add row should get focus after the next render
   visionBoards: [],
   visionBoardChecklist: [],
   visionBoardImages: [],
@@ -96,11 +98,50 @@ async function sha256(text) {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function toast(msg) {
+// Small per-browser UI preferences (which panels are open etc.) - not data.
+function pref(key, fallback) {
+  try { const v = localStorage.getItem('budget_pref_' + key); return v === null ? fallback : v === 'true'; }
+  catch (e) { return fallback; }
+}
+function setPref(key, val) {
+  try { localStorage.setItem('budget_pref_' + key, String(!!val)); } catch (e) { /* private mode etc. */ }
+}
+
+let toastTimer = null;
+// opts.error -> red + stays longer. opts.undo -> adds an Undo button.
+function toast(msg, opts = {}) {
   const t = $('#toast');
   t.textContent = msg;
+  t.classList.toggle('error', !!opts.error);
+  if (opts.undo) {
+    const b = document.createElement('button');
+    b.className = 'toast-undo';
+    b.textContent = 'Undo';
+    b.onclick = () => { t.classList.remove('active'); opts.undo(); };
+    t.appendChild(b);
+  }
   t.classList.add('active');
-  setTimeout(() => t.classList.remove('active'), 2200);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('active'), opts.undo ? 6000 : opts.error ? 5000 : 2200);
+}
+
+// Every database write goes through this: shows the error if it failed (and
+// returns false so the caller stops), or an optional confirmation if it worked.
+function dbOk(res, okMsg) {
+  if (res && res.error) {
+    toast("Couldn't save: " + (res.error.message || 'unknown error'), { error: true });
+    return false;
+  }
+  if (okMsg) toast(okMsg);
+  return true;
+}
+
+// Archive / restore with an Undo on the toast, instead of a confirm dialog.
+async function setArchived(table, id, archived, label) {
+  if (!dbOk(await db.from(table).update({ archived }).eq('id', id))) return;
+  await loadAll(); renderView();
+  if (archived) toast(`${label} archived`, { undo: () => setArchived(table, id, false, label) });
+  else toast(`${label} restored`);
 }
 
 /* ---------------- AUTH ---------------- */
@@ -475,6 +516,43 @@ function generateScheduleRows(inst) {
   return rows;
 }
 
+function datePassed(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return d < today;
+}
+// A schedule row is paid if you said so (row.paid true/false). If you've never
+// touched it (null), it falls back to the old rule: paid once its date passes.
+function isRowPaid(row) {
+  if (row.paid === true || row.paid === false) return row.paid;
+  return datePassed(row.due_date);
+}
+function rowStatus(row) {
+  if (isRowPaid(row)) return 'paid';
+  return datePassed(row.due_date) ? 'overdue' : 'upcoming';
+}
+
+// The period you're most likely working on: the next one that hasn't passed
+// yet, or the latest one if they're all in the past.
+function currentPeriodId(periods) {
+  const today = toLocalISODate(new Date());
+  const sorted = periods.slice().sort((a, b) => a.period_date.localeCompare(b.period_date));
+  const upcoming = sorted.find(p => p.period_date >= today);
+  return (upcoming || sorted[sorted.length - 1]).id;
+}
+// The period right before a given date - its ending savings is what carries
+// over as "Previous savings".
+function previousPeriodOf(dateStr, excludeId) {
+  if (!dateStr) return null;
+  return state.periods
+    .filter(p => !p.archived && p.id !== excludeId && p.period_date < dateStr)
+    .sort((a, b) => b.period_date.localeCompare(a.period_date))[0] || null;
+}
+function shortDate(dateStr) {
+  return new Date(dateStr + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
+}
+const round2 = n => Math.round(Number(n) * 100) / 100;
+
 function incomeItemsForPeriod(periodId) {
   return state.incomeItems.filter(i => i.period_id === periodId);
 }
@@ -550,8 +628,8 @@ function renderSummary() {
         <div class="ph">
           <div><span class="tag">${p.period_type}</span></div>
           <div>
-            <button class="icon-btn edit" data-edit="${p.id}" title="Edit">✎</button>
-            <button class="icon-btn" data-archive="${p.id}" title="Archive">📦</button>
+            <button class="icon-btn edit" data-edit="${p.id}" title="Edit" aria-label="Edit">✎</button>
+            <button class="icon-btn" data-archive="${p.id}" title="Archive" aria-label="Archive">📦</button>
           </div>
         </div>
         <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
@@ -561,8 +639,8 @@ function renderSummary() {
         ${incomeItemsForPeriod(p.id).map(item => `
           <div class="line">
             <span class="lbl">${escapeHtml(item.label)}
-              <button class="icon-btn edit" data-edit-income="${item.id}" style="width:20px;height:20px;font-size:10px;margin-left:4px;">✎</button>
-              <button class="icon-btn" data-del-income="${item.id}" style="width:20px;height:20px;font-size:10px;">✕</button>
+              <button class="icon-btn edit" data-edit-income="${item.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
+              <button class="icon-btn" data-del-income="${item.id}" title="Delete" aria-label="Delete">✕</button>
             </span>
             <span class="val">${PESO(item.amount)}</span>
           </div>`).join('')}
@@ -584,13 +662,32 @@ function renderSummary() {
       </div>`;
   }
 
-  monthKeys.forEach(mk => {
+  // Only the newest few months are shown in full; older ones fold down to a
+  // one-line total you can click open.
+  const RECENT_MONTHS_SHOWN = 3;
+  monthKeys.forEach((mk, idx) => {
     const pair = byMonth.get(mk);
     const monthLabel = new Date(mk + '-01T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
     const el = document.createElement('div');
     el.className = 'period-group-card';
+    const collapsible = idx >= RECENT_MONTHS_SHOWN;
+    if (collapsible && !state.expandedMonths.has(mk)) {
+      const ps = ['15th', '30th'].map(t => pair[t]).filter(Boolean);
+      const outflow = ps.reduce((sum, p) => sum + periodTotals(p).outflow, 0);
+      const endSavings = periodTotals(ps[ps.length - 1]).savings;
+      el.classList.add('collapsed');
+      el.innerHTML = `
+        <button class="pg-toggle" data-toggle-month="${mk}" title="Show this month">
+          <span class="pg-header">▸ ${monthLabel}</span>
+          <span class="pg-mini">Outflow <b>${PESO(outflow)}</b><span class="pg-sep">·</span>Ended with <b style="color:${endSavings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(endSavings)}</b></span>
+        </button>`;
+      groupsWrap.appendChild(el);
+      return;
+    }
     el.innerHTML = `
-      <div class="pg-header">${monthLabel}</div>
+      ${collapsible
+        ? `<button class="pg-toggle" data-toggle-month="${mk}" title="Collapse this month"><span class="pg-header">▾ ${monthLabel}</span></button>`
+        : `<div class="pg-header">${monthLabel}</div>`}
       <div class="period-subgrid">
         ${pair['15th'] ? periodBoxHtml(pair['15th'], pair) : emptyBoxHtml('15th', mk)}
         ${pair['30th'] ? periodBoxHtml(pair['30th'], pair) : emptyBoxHtml('30th', mk)}
@@ -599,6 +696,11 @@ function renderSummary() {
     groupsWrap.appendChild(el);
   });
 
+  $$('[data-toggle-month]').forEach(b => b.onclick = () => {
+    const mk = b.dataset.toggleMonth;
+    if (state.expandedMonths.has(mk)) state.expandedMonths.delete(mk); else state.expandedMonths.add(mk);
+    renderSummary();
+  });
   $$('[data-add-single]').forEach(b => b.onclick = () => {
     const [mk, type] = b.dataset.addSingle.split('|');
     const day = type === '15th' ? '15' : String(Math.min(30, new Date(Number(mk.slice(0, 4)), Number(mk.slice(5, 7)), 0).getDate())).padStart(2, '0');
@@ -606,10 +708,7 @@ function renderSummary() {
   });
   $$('[data-edit]').forEach(b => b.onclick = () => openPeriodModal(periods.find(p => p.id === b.dataset.edit)));
   wireRevealToggles();
-  $$('[data-archive]').forEach(b => b.onclick = async () => {
-    await db.from('periods').update({ archived: true }).eq('id', b.dataset.archive);
-    await loadAll(); renderView();
-  });
+  $$('[data-archive]').forEach(b => b.onclick = () => setArchived('periods', b.dataset.archive, true, 'Period'));
   $$('[data-add-income]').forEach(b => b.onclick = () => openIncomeItemModal(null, b.dataset.addIncome));
   $$('[data-edit-income]').forEach(b => b.onclick = () => {
     const item = state.incomeItems.find(x => x.id === b.dataset.editIncome);
@@ -617,7 +716,7 @@ function renderSummary() {
   });
   $$('[data-del-income]').forEach(b => b.onclick = async () => {
     if (!confirm('Delete this income line?')) return;
-    await db.from('income_items').delete().eq('id', b.dataset.delIncome);
+    if (!dbOk(await db.from('income_items').delete().eq('id', b.dataset.delIncome))) return;
     await loadAll(); renderView();
   });
 
@@ -633,16 +732,13 @@ function renderSummary() {
             <span class="tag">${p.period_type}</span>
             <div class="date">${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>
           </div>
-          <div><button class="icon-btn edit" data-restore="${p.id}" title="Restore">♻️</button></div>
+          <div><button class="icon-btn edit" data-restore="${p.id}" title="Restore" aria-label="Restore">♻️</button></div>
         </div>
         <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)}</span></div>
       `;
       ag.appendChild(el);
     });
-    $$('[data-restore]').forEach(b => b.onclick = async () => {
-      await db.from('periods').update({ archived: false }).eq('id', b.dataset.restore);
-      await loadAll(); renderView();
-    });
+    $$('[data-restore]').forEach(b => b.onclick = () => setArchived('periods', b.dataset.restore, false, 'Period'));
   }
 }
 
@@ -666,7 +762,7 @@ function openIncomeItemModal(item, periodId) {
     let error;
     if (isEdit) ({ error } = await db.from('income_items').update(payload).eq('id', i.id));
     else ({ error } = await db.from('income_items').insert(payload));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -677,7 +773,7 @@ function openNewMonthPeriodModal() {
     <div class="field-row">
       <div class="field"><label>Month</label><input type="month" id="f-month"></div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);">Creates both the 15th and 30th boxes for this month (skips any that already exist) — edit each one afterward to fill in the details.</p>
+    <p style="font-size:12px;color:var(--text-dim);">Creates both the 15th and 30th boxes for this month (skips any that already exist) — edit each one afterward to fill in the details. The 15th starts with whatever your last period ended with; the 30th's "Previous savings" has a one-click carry-over button once the 15th is filled in.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Create</button>
@@ -694,11 +790,12 @@ function openNewMonthPeriodModal() {
     const has15 = state.periods.some(p => p.period_date === date15 && p.period_type === '15th');
     const has30 = state.periods.some(p => p.period_date === date30 && p.period_type === '30th');
     const rows = [];
-    if (!has15) rows.push({ period_date: date15, period_type: '15th', salary: 0, previous_savings: 0 });
+    const before15 = previousPeriodOf(date15);
+    if (!has15) rows.push({ period_date: date15, period_type: '15th', salary: 0, previous_savings: before15 ? round2(periodTotals(before15).savings) : 0 });
     if (!has30) rows.push({ period_date: date30, period_type: '30th', salary: 0, previous_savings: 0 });
     if (!rows.length) { toast('Both periods already exist for this month'); return; }
     const { error } = await db.from('periods').insert(rows);
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -706,6 +803,11 @@ function openNewMonthPeriodModal() {
 function openPeriodModal(period, defaultDate, defaultType) {
   const isEdit = !!period;
   const p = period || { period_date: defaultDate || '', period_type: defaultType || '15th', salary: 0, previous_savings: 0, wifey: 0 };
+  if (!isEdit) {
+    // Brand-new period: start from what the period before it ended with.
+    const before = previousPeriodOf(p.period_date);
+    if (before) p.previous_savings = round2(periodTotals(before).savings);
+  }
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} period</h3>
     <div class="field-row">
@@ -721,12 +823,31 @@ function openPeriodModal(period, defaultDate, defaultType) {
       <div class="field"><label>Salary</label><input type="number" step="0.01" id="f-salary" value="${p.salary}"></div>
       <div class="field"><label>Previous savings</label><input type="number" step="0.01" id="f-prev" value="${p.previous_savings}"></div>
     </div>
+    <div id="carry-wrap"></div>
     <p style="font-size:12px;color:var(--text-dim);">Justine isn't entered here anymore — tag her transactions as "Justine's" on the Transactions tab and it totals up automatically. Spaylater isn't here either — add it as a General Ledger installment instead.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
     </div>
   `);
+  // Offers the previous period's ending savings whenever the field doesn't
+  // already match it - one click instead of copying the number by hand.
+  const updateCarry = () => {
+    const before = previousPeriodOf($('#f-date').value, p.id);
+    const wrap = $('#carry-wrap');
+    if (!before) { wrap.innerHTML = ''; return; }
+    const carry = round2(periodTotals(before).savings);
+    if (round2(+$('#f-prev').value || 0) === carry) {
+      wrap.innerHTML = `<div class="carry-note">✓ Matches what ${shortDate(before.period_date)} ended with</div>`;
+      return;
+    }
+    wrap.innerHTML = `<button type="button" class="carry-btn" id="carry-btn">↩ Use ${PESO(carry)} — what ${shortDate(before.period_date)} ended with</button>`;
+    $('#carry-btn').onclick = () => { $('#f-prev').value = carry; updateCarry(); };
+  };
+  $('#f-date').onchange = updateCarry;
+  $('#f-prev').oninput = updateCarry;
+  updateCarry();
+
   $('#modal-save').onclick = async () => {
     const payload = {
       period_date: $('#f-date').value,
@@ -738,7 +859,7 @@ function openPeriodModal(period, defaultDate, defaultType) {
     let error;
     if (isEdit) ({ error } = await db.from('periods').update(payload).eq('id', p.id));
     else ({ error } = await db.from('periods').insert(payload));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -759,7 +880,7 @@ function renderTransactions() {
     return;
   }
   if (!state.txnPeriodId || !activePeriods.find(p => p.id === state.txnPeriodId)) {
-    state.txnPeriodId = activePeriods[0].id;
+    state.txnPeriodId = currentPeriodId(activePeriods);
   }
   const period = activePeriods.find(p => p.id === state.txnPeriodId);
 
@@ -818,7 +939,7 @@ function renderTransactions() {
 
   function editButtons(row) {
     if (row.installmentId) return `<button class="synced-badge" data-edit-inst-sched="${row.installmentId}" style="border:none;cursor:pointer;" title="From an installment schedule - click to edit this period's split">⇄ edit split</button>`;
-    if (row.editable) return `<button class="icon-btn edit" data-edit-adj="${row.id}">✎</button><button class="icon-btn" data-del-adj="${row.id}">✕</button>`;
+    if (row.editable) return `<button class="icon-btn edit" data-edit-adj="${row.id}" title="Edit" aria-label="Edit">✎</button><button class="icon-btn" data-del-adj="${row.id}" title="Delete" aria-label="Delete">✕</button>`;
     return '';
   }
 
@@ -874,7 +995,7 @@ function renderTransactions() {
   });
   $$('#txn-snapshot [data-del-adj]').forEach(b => b.onclick = async () => {
     if (!confirm('Delete this entry?')) return;
-    await db.from('wifey_adjustments').delete().eq('id', b.dataset.delAdj);
+    if (!dbOk(await db.from('wifey_adjustments').delete().eq('id', b.dataset.delAdj))) return;
     await loadAll(); renderView();
   });
   $$('#txn-snapshot [data-edit-inst-sched]').forEach(b => b.onclick = () => {
@@ -919,7 +1040,7 @@ function renderTransactions() {
         <h3><span class="card-chip"><span class="sw" style="background:${card.color}"></span>${card.name}${statementBadge(card, period.period_date)}${offCycle ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);" title="This card is set to be paid on the ${card.pay_period}, but it has entries in this period">⚠ normally a ${card.pay_period} card</span>` : ''}</span></h3>
         <div style="display:flex;align-items:center;gap:14px;">
           <span class="total">${PESO(total)}</span>
-          <button class="btn secondary" data-add="${card.id}" style="padding:6px 12px;font-size:13px;">+ Add</button>
+          <button class="btn secondary" data-add="${card.id}" style="padding:6px 12px;font-size:13px;" title="Full form: type and Justine's split">+ Add with split</button>
         </div>
       </div>
       ${(rows.length || virtualRows.length) ? `<table>
@@ -954,13 +1075,18 @@ function renderTransactions() {
               <td>${splitHtml}</td>
               <td class="num">${PESO(t.amount)}</td>
               <td style="text-align:right;white-space:nowrap;">
-                <button class="icon-btn edit" data-edit-txn="${t.id}">✎</button>
-                <button class="icon-btn" data-del-txn="${t.id}">✕</button>
+                <button class="icon-btn edit" data-edit-txn="${t.id}" title="Edit" aria-label="Edit">✎</button>
+                <button class="icon-btn" data-del-txn="${t.id}" title="Delete" aria-label="Delete">✕</button>
               </td>
             </tr>`;
           }).join('')}
         </tbody>
-      </table>` : `<div class="empty-state">No transactions yet for this card in this period.</div>`}
+      </table>` : `<div class="empty-state" style="padding:14px;font-size:13px;">No transactions yet for this card in this period.</div>`}
+      <form class="quick-add" data-quick="${card.id}" autocomplete="off">
+        <input type="text" data-quick-desc placeholder="Quick add — description" aria-label="Description">
+        <input type="number" step="0.01" data-quick-amt placeholder="Amount" aria-label="Amount" inputmode="decimal">
+        <button type="submit" class="btn secondary">Add ↵</button>
+      </form>
     `;
     wrap.appendChild(sec);
   });
@@ -969,6 +1095,33 @@ function renderTransactions() {
     if (inst) openScheduleModal(inst);
   });
 
+  // Quick add: type, Enter, type the next one. Saves as a plain bill that's all
+  // yours (use the pencil or "+ Add with split" for anything else). The new row
+  // is added locally instead of reloading everything, so it's instant.
+  $$('form[data-quick]').forEach(f => f.onsubmit = async e => {
+    e.preventDefault();
+    const desc = f.querySelector('[data-quick-desc]');
+    const amt = f.querySelector('[data-quick-amt]');
+    const description = desc.value.trim();
+    const amount = +amt.value;
+    if (!description) { desc.focus(); return; }
+    if (!amt.value || !amount) { amt.focus(); return; }
+    const btn = f.querySelector('button');
+    btn.disabled = true;
+    const res = await db.from('transactions').insert({
+      description, amount, kind: 'bill', wifey_share: 0, card_id: f.dataset.quick, period_id: period.id,
+    }).select().single();
+    if (!dbOk(res) || !res.data) { btn.disabled = false; return; }
+    state.transactions.push(res.data);
+    state.quickFocusCardId = f.dataset.quick;
+    renderTransactions();
+  });
+  if (state.quickFocusCardId) {
+    const next = $(`form[data-quick="${state.quickFocusCardId}"] [data-quick-desc]`);
+    state.quickFocusCardId = null;
+    if (next) next.focus();
+  }
+
   $$('[data-add]').forEach(b => b.onclick = () => openTxnModal(null, b.dataset.add, period.id));
   $$('[data-edit-txn]').forEach(b => b.onclick = () => {
     const t = state.transactions.find(x => x.id === b.dataset.editTxn);
@@ -976,8 +1129,9 @@ function renderTransactions() {
   });
   $$('[data-del-txn]').forEach(b => b.onclick = async () => {
     if (!confirm('Delete this transaction?')) return;
-    await db.from('transactions').delete().eq('id', b.dataset.delTxn);
-    await loadAll(); renderView();
+    if (!dbOk(await db.from('transactions').delete().eq('id', b.dataset.delTxn))) return;
+    state.transactions = state.transactions.filter(t => t.id !== b.dataset.delTxn);
+    renderView();
   });
 }
 
@@ -1004,7 +1158,7 @@ function openAdjustmentModal(adj, periodId) {
     let error;
     if (isEdit) ({ error } = await db.from('wifey_adjustments').update(payload).eq('id', a.id));
     else ({ error } = await db.from('wifey_adjustments').insert(payload));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -1068,7 +1222,7 @@ function openTxnModal(txn, cardId, periodId) {
     let error;
     if (isEdit) ({ error } = await db.from('transactions').update(payload).eq('id', t.id));
     else ({ error } = await db.from('transactions').insert(payload));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -1082,8 +1236,8 @@ function installmentMetrics(i) {
   const totalToPay = schedule.reduce((s, r) => s + totalAmountForRow(i, r), 0);
   const interest = Math.max(totalToPay - principal - fee, 0);   // pure installment interest, excluding the one-time fee
   const financeCharge = interest + fee;                          // total cost of credit for this plan
-  const remaining = schedule.filter(r => scheduleStatus(r.due_date) !== 'paid').reduce((s, r) => s + totalAmountForRow(i, r), 0);
-  const paidCount = schedule.filter(r => scheduleStatus(r.due_date) === 'paid').length;
+  const remaining = schedule.filter(r => !isRowPaid(r)).reduce((s, r) => s + totalAmountForRow(i, r), 0);
+  const paidCount = schedule.filter(r => isRowPaid(r)).length;
   const done = schedule.length > 0 && paidCount >= schedule.length;
   const endDate = schedule.length ? schedule[schedule.length - 1].due_date : null;
   const card = state.cards.find(c => c.id === i.card_id) || null;
@@ -1104,6 +1258,8 @@ function estimateMonthlyIncome() {
 
 function renderInstallmentsDashboard(list) {
   const wrap = $('#install-dashboard');
+  const more = $('#install-dashboard-more');
+  more.innerHTML = '';
   if (!list.length) {
     wrap.innerHTML = `<div class="section-card"><div class="empty-state">No installments yet — add one to see your dashboard.</div></div>`;
     return;
@@ -1130,7 +1286,7 @@ function renderInstallmentsDashboard(list) {
   const counterpartLabel = state.profile === 'joven' ? 'Justine' : 'Joven';
   const counterpartMonthly = activeMetrics.reduce((s, x) => s + Number(x.i.wifey_monthly_share || 0), 0);
   const counterpartRemaining = metricsList.reduce((s, x) => {
-    const cpRem = x.m.schedule.filter(r => scheduleStatus(r.due_date) !== 'paid').reduce((ss, r) => ss + totalWifeyShareForRow(x.i, r), 0);
+    const cpRem = x.m.schedule.filter(r => !isRowPaid(r)).reduce((ss, r) => ss + totalWifeyShareForRow(x.i, r), 0);
     return s + cpRem;
   }, 0);
   const counterpartLifetime = metricsList.reduce((s, x) => {
@@ -1222,16 +1378,30 @@ function renderInstallmentsDashboard(list) {
       ${monthRows}`;
   }
 
+  // Above the plan list: just the four numbers you check most.
   wrap.innerHTML = `
     <div class="dash-stats">
       <div class="stat-card"><div class="stat-label">Active plans</div><div class="stat-value">${activeMetrics.length}</div></div>
       <div class="stat-card"><div class="stat-label">Outstanding balance</div><div class="stat-value">${PESO(totalOutstanding)}</div></div>
       <div class="stat-card"><div class="stat-label">Monthly obligation</div><div class="stat-value">${PESO(totalMonthlyObligation)}</div></div>
+      <div class="stat-card"><div class="stat-label">Debt-free by</div><div class="stat-value">${debtFreeDate ? new Date(debtFreeDate + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }) : '—'}</div></div>
+    </div>
+  `;
+
+  // Below the plan list: the payoff timeline, then everything else folded away.
+  more.innerHTML = `
+    <div class="dash-timeline" style="margin-top:22px;">
+      <h4>Payoff timeline <span>what finishes each month, and what that frees up</span></h4>
+      ${timelineHtml}
+    </div>
+
+    <details class="dash-more" id="dash-more" ${pref('dash_more_open', false) ? 'open' : ''}>
+    <summary>More stats, split with ${counterpartLabel} &amp; bank rankings</summary>
+    <div class="dash-stats">
       <div class="stat-card"><div class="stat-label">Debt-to-income (net)</div><div class="stat-value">${dtiNet !== null ? dtiNet.toFixed(1) + '%' : '—'}</div><div class="stat-note">${dtiNet !== null ? `net of ${counterpartLabel}'s share` : 'add a period first'}</div></div>
       <div class="stat-card"><div class="stat-label">Avg plan rate</div><div class="stat-value">${avgPlanRate.toFixed(1)}%</div><div class="stat-note">mean across plans</div></div>
       <div class="stat-card"><div class="stat-label">Cost of credit</div><div class="stat-value">${costOfCredit.toFixed(1)}%</div><div class="stat-note">₱-weighted overall</div></div>
       <div class="stat-card"><div class="stat-label">Paid off so far</div><div class="stat-value">${overallPaidPct.toFixed(1)}%</div><div class="stat-note">of lifetime total</div></div>
-      <div class="stat-card"><div class="stat-label">Debt-free by</div><div class="stat-value">${debtFreeDate ? new Date(debtFreeDate + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }) : '—'}</div></div>
     </div>
 
     <div class="dash-timeline" style="margin-bottom:22px;">
@@ -1259,24 +1429,16 @@ function renderInstallmentsDashboard(list) {
         ${rankListHtml(byFee, b => b.feeRate, v => v.toFixed(1) + '%')}
       </div>
     </div>
-
-    <div class="dash-timeline">
-      <h4>Payoff timeline <span>what finishes each month, and what that frees up</span></h4>
-      ${timelineHtml}
-    </div>
+    </details>
   `;
+  $('#dash-more').ontoggle = e => setPref('dash_more_open', e.target.open);
 }
 
-function scheduleStatus(dueDateStr) {
-  const due = new Date(dueDateStr + 'T00:00:00');
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  if (due < today) return 'paid';
-  return 'upcoming';
-}
+// "Next due" = the first upcoming row that isn't paid yet (overdue rows get
+// their own red badge instead).
 function nextDueRowId(schedule) {
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const future = schedule.filter(r => new Date(r.due_date + 'T00:00:00') >= today);
-  return future.length ? future[0].id : null;
+  const next = schedule.find(r => rowStatus(r) === 'upcoming');
+  return next ? next.id : null;
 }
 
 function renderInstallments() {
@@ -1296,9 +1458,14 @@ function renderInstallments() {
     <div id="install-dashboard"></div>
     <div class="card-select-tabs" id="install-tabs"></div>
     <div class="install-grid" id="install-grid"></div>
+    <div id="install-dashboard-more"></div>
   `;
   $('#add-install-btn').onclick = () => openInstallModal();
-  $('#toggle-dashboard').onclick = () => { state.showInstallDashboard = !state.showInstallDashboard; renderInstallments(); };
+  $('#toggle-dashboard').onclick = () => {
+    state.showInstallDashboard = !state.showInstallDashboard;
+    setPref('show_install_dash', state.showInstallDashboard);
+    renderInstallments();
+  };
   if (state.showInstallDashboard) renderInstallmentsDashboard(activeAll);
   if ($('#toggle-archived-installments')) $('#toggle-archived-installments').onclick = () => { state.showArchivedInstallments = !state.showArchivedInstallments; renderInstallments(); };
 
@@ -1322,7 +1489,8 @@ function renderInstallments() {
   list.forEach(i => {
     const card = state.cards.find(c => c.id === i.card_id);
     const schedule = scheduleForInstallment(i.id);
-    const paidCount = schedule.filter(r => scheduleStatus(r.due_date) === 'paid').length;
+    const paidCount = schedule.filter(r => isRowPaid(r)).length;
+    const overdueCount = schedule.filter(r => rowStatus(r) === 'overdue').length;
     const pct = schedule.length ? Math.round((paidCount / schedule.length) * 100) : 0;
     const done = schedule.length > 0 && paidCount >= schedule.length;
     const nextId = nextDueRowId(schedule);
@@ -1340,7 +1508,7 @@ function renderInstallments() {
       <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo</div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%;background:${done ? 'var(--green)' : 'var(--gold)'}"></div></div>
       <div class="foot">
-        <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}</span>
+        <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}${overdueCount ? ` <b style="color:var(--red);">· ${overdueCount} overdue</b>` : ''}</span>
         <span class="end">${done ? '✓ Paid off' : lastRow ? 'ends ' + new Date(lastRow.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }) : ''}</span>
       </div>
       ${principal > 0 ? `
@@ -1357,11 +1525,11 @@ function renderInstallments() {
         <button class="btn secondary" data-view-sched="${i.id}" style="padding:6px 12px;font-size:12px;">View schedule</button>
         <div>
           ${i.archived ? `
-            <button class="icon-btn edit" data-restore-i="${i.id}" title="Restore">♻️</button>
-            <button class="icon-btn" data-del-i="${i.id}" title="Delete permanently">✕</button>
+            <button class="icon-btn edit" data-restore-i="${i.id}" title="Restore" aria-label="Restore">♻️</button>
+            <button class="icon-btn" data-del-i="${i.id}" title="Delete permanently" aria-label="Delete permanently">✕</button>
           ` : `
-            <button class="icon-btn edit" data-edit-i="${i.id}">✎</button>
-            <button class="icon-btn" data-archive-i="${i.id}" title="Archive">📦</button>
+            <button class="icon-btn edit" data-edit-i="${i.id}" title="Edit" aria-label="Edit">✎</button>
+            <button class="icon-btn" data-archive-i="${i.id}" title="Archive" aria-label="Archive">📦</button>
           `}
         </div>
       </div>
@@ -1370,56 +1538,58 @@ function renderInstallments() {
   });
   $$('[data-edit-i]').forEach(b => b.onclick = () => openInstallModal(state.installments.find(x => x.id === b.dataset.editI)));
   $$('[data-view-sched]').forEach(b => b.onclick = () => openScheduleModal(state.installments.find(x => x.id === b.dataset.viewSched)));
-  $$('[data-archive-i]').forEach(b => b.onclick = async () => {
-    await db.from('installments').update({ archived: true }).eq('id', b.dataset.archiveI);
-    await loadAll(); renderView();
-  });
-  $$('[data-restore-i]').forEach(b => b.onclick = async () => {
-    await db.from('installments').update({ archived: false }).eq('id', b.dataset.restoreI);
-    await loadAll(); renderView();
-  });
+  $$('[data-archive-i]').forEach(b => b.onclick = () => setArchived('installments', b.dataset.archiveI, true, 'Installment'));
+  $$('[data-restore-i]').forEach(b => b.onclick = () => setArchived('installments', b.dataset.restoreI, false, 'Installment'));
   $$('[data-del-i]').forEach(b => b.onclick = async () => {
     if (!confirm('Permanently delete this installment plan and its schedule? This can\'t be undone.')) return;
-    await db.from('installments').delete().eq('id', b.dataset.delI);
+    if (!dbOk(await db.from('installments').delete().eq('id', b.dataset.delI), 'Installment deleted')) return;
     await loadAll(); renderView();
   });
 }
 
 async function regenerateSchedule(inst) {
-  await db.from('installment_schedule').delete().eq('installment_id', inst.id);
+  if (!dbOk(await db.from('installment_schedule').delete().eq('installment_id', inst.id))) return;
   const rows = generateScheduleRows(inst).map((r, idx) => ({
     installment_id: inst.id, due_date: r.due_date, amount: r.amount, wifey_share: r.wifey_share, is_fee_row: idx === 0,
   }));
-  if (rows.length) await db.from('installment_schedule').insert(rows);
+  if (rows.length) dbOk(await db.from('installment_schedule').insert(rows));
 }
 
 function openScheduleModal(inst) {
   const schedule = scheduleForInstallment(inst.id);
   const nextId = nextDueRowId(schedule);
   const counterpartLabel = inst.owner === 'joven' ? "Justine's share" : "Joven's share";
+  // The Paid column only appears once migration_schedule_paid.sql has been run.
+  const hasPaidCol = state.installmentSchedule.some(r => 'paid' in r);
+  const inputStyle = 'width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;';
   showModal(`
     <h3>${escapeHtml(inst.name)} — schedule</h3>
-    <p style="font-size:12px;color:var(--text-dim);margin-top:-8px;">Green = already paid. Gold = next due. Edit ${counterpartLabel.toLowerCase()} per period if it ever changes.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-top:-8px;">${hasPaidCol
+      ? `Rows tick themselves as paid once the due date passes. Untick one you missed (it turns red and counts as still owed), or tick a future one you paid early.`
+      : `Green = already paid (by date). Gold = next due.`} Edit ${counterpartLabel.toLowerCase()} per period if it ever changes.</p>
     <div style="max-height:50vh;overflow-y:auto;">
     <table>
-      <thead><tr><th>Due</th><th class="num">Amount</th><th class="num">${counterpartLabel}</th><th></th></tr></thead>
+      <thead><tr>${hasPaidCol ? '<th>Paid</th>' : ''}<th>Due</th><th class="num">Amount</th><th class="num">${counterpartLabel}</th></tr></thead>
       <tbody id="sched-body">
         ${schedule.map(r => {
-          const status = scheduleStatus(r.due_date);
+          const status = rowStatus(r);
           const isNext = r.id === nextId;
-          const rowColor = status === 'paid' ? 'rgba(79,216,151,.08)' : isNext ? 'rgba(227,177,88,.12)' : 'transparent';
+          const rowColor = status === 'paid' ? 'rgba(79,216,151,.08)' : status === 'overdue' ? 'rgba(244,117,111,.10)' : isNext ? 'rgba(227,177,88,.12)' : 'transparent';
+          const badge = status === 'overdue' ? '<span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);">overdue</span>'
+            : isNext ? '<span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);">next due</span>'
+            : status === 'paid' ? '<span class="synced-badge">paid</span>' : '';
           return `
           <tr style="background:${rowColor};">
-            <td>${new Date(r.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })} ${isNext ? '<span class="synced-badge" style="color:var(--gold);background:rgba(227,177,88,.15);">next due</span>' : status === 'paid' ? '<span class="synced-badge">paid</span>' : ''}${r.is_fee_row && Number(inst.fee) > 0 ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);">+₱${Number(inst.fee).toFixed(2)} fee</span>` : ''}</td>
+            ${hasPaidCol ? `<td><input type="checkbox" data-row-id="${r.id}" data-field="paid" ${status === 'paid' ? 'checked' : ''} aria-label="Paid" style="width:18px;height:18px;accent-color:var(--green);cursor:pointer;"></td>` : ''}
+            <td>${new Date(r.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })} ${badge}${r.is_fee_row && Number(inst.fee) > 0 ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);">+₱${Number(inst.fee).toFixed(2)} fee</span>` : ''}</td>
             <td class="num">
-              <input type="number" step="0.01" data-row-id="${r.id}" data-field="amount" value="${r.amount}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;">
+              <input type="number" step="0.01" data-row-id="${r.id}" data-field="amount" value="${r.amount}" style="${inputStyle}">
               ${r.is_fee_row && Number(inst.fee) > 0 ? `<div style="font-size:10px;color:var(--text-dim);margin-top:3px;">= ${PESO(totalAmountForRow(inst, r))} total w/ fee</div>` : ''}
             </td>
             <td class="num">
-              <input type="number" step="0.01" data-row-id="${r.id}" data-field="wifey_share" value="${r.wifey_share}" style="width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;">
+              <input type="number" step="0.01" data-row-id="${r.id}" data-field="wifey_share" value="${r.wifey_share}" style="${inputStyle}">
               ${r.is_fee_row && Number(inst.wifey_fee_share) > 0 ? `<div style="font-size:10px;color:var(--text-dim);margin-top:3px;">= ${PESO(totalWifeyShareForRow(inst, r))} total w/ fee</div>` : ''}
             </td>
-            <td></td>
           </tr>`;
         }).join('')}
       </tbody>
@@ -1432,13 +1602,30 @@ function openScheduleModal(inst) {
     </div>
   `);
   $('#modal-save').onclick = async () => {
-    const rowIds = [...new Set($$('#sched-body input[data-row-id]').map(inp => inp.dataset.rowId))];
-    for (const id of rowIds) {
-      const amt = $(`#sched-body input[data-row-id="${id}"][data-field="amount"]`);
-      const wsh = $(`#sched-body input[data-row-id="${id}"][data-field="wifey_share"]`);
-      await db.from('installment_schedule').update({ amount: +amt.value || 0, wifey_share: +wsh.value || 0 }).eq('id', id);
-    }
+    // Only rows you actually changed get written, all at once.
+    const updates = [];
+    schedule.forEach(r => {
+      const amount = +$(`#sched-body input[data-row-id="${r.id}"][data-field="amount"]`).value || 0;
+      const wifey_share = +$(`#sched-body input[data-row-id="${r.id}"][data-field="wifey_share"]`).value || 0;
+      const patch = {};
+      if (amount !== Number(r.amount)) patch.amount = amount;
+      if (wifey_share !== Number(r.wifey_share || 0)) patch.wifey_share = wifey_share;
+      if (hasPaidCol) {
+        const checked = $(`#sched-body input[data-row-id="${r.id}"][data-field="paid"]`).checked;
+        // Store an explicit value only when it differs from the by-date default,
+        // so untouched future rows keep ticking themselves when their date passes.
+        const paid = checked === datePassed(r.due_date) ? null : checked;
+        if (paid !== (r.paid === undefined ? null : r.paid)) patch.paid = paid;
+      }
+      if (Object.keys(patch).length) updates.push(db.from('installment_schedule').update(patch).eq('id', r.id));
+    });
+    if (!updates.length) { closeModal(); return; }
+    $('#modal-save').disabled = true;
+    const results = await Promise.all(updates);
+    const failed = results.find(res => res.error);
+    if (failed) { dbOk(failed); $('#modal-save').disabled = false; await loadAll(); return; }
     closeModal(); await loadAll(); renderView();
+    toast(`Schedule saved (${updates.length} row${updates.length === 1 ? '' : 's'})`);
   };
 }
 
@@ -1507,7 +1694,7 @@ function openInstallModal(item) {
       const res = await db.from('installments').insert({ ...payload, owner: state.profile }).select().single();
       error = res.error; savedId = res.data ? res.data.id : null;
     }
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     // Only wipe/regenerate the schedule on a brand-new installment, or when a
     // field that actually changes the schedule's shape was edited. Editing
     // unrelated fields (name, payer, billed-to-card) leaves your per-period
@@ -1601,7 +1788,7 @@ function renderVisionBoardGrid() {
     el.innerHTML = `
       <div class="vision-cover" style="background:${coverImg ? `url('${coverImg.data_url}') center/cover` : `linear-gradient(135deg, ${b.color}33, ${b.color}0d)`};">
         ${!coverImg ? `<span class="vision-cover-emoji">${escapeHtml(b.emoji)}</span>` : ''}
-        ${!state.showArchivedVisionBoards ? `<button class="icon-btn" data-archive-vision="${b.id}" title="Archive" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.5);border:none;">📦</button>` : `<button class="icon-btn" data-restore-vision="${b.id}" title="Restore" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.5);border:none;">♻️</button>`}
+        ${!state.showArchivedVisionBoards ? `<button class="icon-btn" data-archive-vision="${b.id}" title="Archive" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.5);border:none;" aria-label="Archive">📦</button>` : `<button class="icon-btn" data-restore-vision="${b.id}" title="Restore" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.5);border:none;" aria-label="Restore">♻️</button>`}
       </div>
       <div class="vision-body">
         <div class="vision-title">${escapeHtml(b.title)}</div>
@@ -1622,15 +1809,13 @@ function renderVisionBoardGrid() {
     }
     grid.appendChild(el);
   });
-  $$('[data-archive-vision]').forEach(b => b.onclick = async e => {
+  $$('[data-archive-vision]').forEach(b => b.onclick = e => {
     e.stopPropagation();
-    await db.from('vision_boards').update({ archived: true }).eq('id', b.dataset.archiveVision);
-    await loadAll(); renderView();
+    setArchived('vision_boards', b.dataset.archiveVision, true, 'Vision');
   });
-  $$('[data-restore-vision]').forEach(b => b.onclick = async e => {
+  $$('[data-restore-vision]').forEach(b => b.onclick = e => {
     e.stopPropagation();
-    await db.from('vision_boards').update({ archived: false }).eq('id', b.dataset.restoreVision);
-    await loadAll(); renderView();
+    setArchived('vision_boards', b.dataset.restoreVision, false, 'Vision');
   });
 }
 
@@ -1665,7 +1850,7 @@ function openVisionBoardModal(board) {
     let error;
     if (isEdit) ({ error } = await db.from('vision_boards').update(payload).eq('id', b.id));
     else ({ error } = await db.from('vision_boards').insert({ ...payload, sort_order: state.visionBoards.length }));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -1686,8 +1871,8 @@ function renderVisionBoardDetail(b) {
           ${b.target_date ? `<div class="subtitle">Target: ${new Date(b.target_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>` : ''}
         </div>
         <div>
-          <button class="icon-btn edit" id="edit-vision-btn" title="Edit">✎</button>
-          <button class="icon-btn" id="archive-vision-detail-btn" title="Archive">📦</button>
+          <button class="icon-btn edit" id="edit-vision-btn" title="Edit" aria-label="Edit">✎</button>
+          <button class="icon-btn" id="archive-vision-detail-btn" title="Archive" aria-label="Archive">📦</button>
         </div>
       </div>
       ${progress ? `<div class="progress-track" style="margin-top:16px;height:8px;"><div class="progress-fill" style="width:${progress.pct}%;background:${b.color};"></div></div><div style="font-size:12px;color:var(--text-dim);margin-top:6px;">${progress.done} of ${progress.total} done</div>` : ''}
@@ -1715,14 +1900,14 @@ function renderVisionBoardDetail(b) {
 
   $('#vision-back-btn').onclick = () => { state.activeVisionBoardId = null; renderView(); };
   $('#edit-vision-btn').onclick = () => openVisionBoardModal(b);
-  $('#archive-vision-detail-btn').onclick = async () => {
-    await db.from('vision_boards').update({ archived: true }).eq('id', b.id);
+  $('#archive-vision-detail-btn').onclick = () => {
     state.activeVisionBoardId = null;
-    await loadAll(); renderView();
+    setArchived('vision_boards', b.id, true, 'Vision');
   };
 
   $('#vision-notes').onblur = async e => {
-    await db.from('vision_boards').update({ notes: e.target.value }).eq('id', b.id);
+    if (e.target.value === (b.notes || '')) return; // nothing changed
+    if (!dbOk(await db.from('vision_boards').update({ notes: e.target.value }).eq('id', b.id), 'Notes saved')) return;
     b.notes = e.target.value;
   };
 
@@ -1733,25 +1918,27 @@ function renderVisionBoardDetail(b) {
         <input type="checkbox" data-toggle-item="${c.id}" ${c.done ? 'checked' : ''} style="width:17px;height:17px;accent-color:${b.color};">
         <span style="${c.done ? 'text-decoration:line-through;color:var(--text-dim);' : ''}">${escapeHtml(c.label)}</span>
       </label>
-      <button class="icon-btn" data-del-item="${c.id}">✕</button>
+      <button class="icon-btn" data-del-item="${c.id}" title="Delete" aria-label="Delete">✕</button>
     </div>
   `).join('') : `<div class="empty-state" style="padding:14px;font-size:13px;">Nothing on the list yet.</div>`;
   $$('[data-toggle-item]').forEach(cb => cb.onchange = async () => {
-    await db.from('vision_board_checklist').update({ done: cb.checked }).eq('id', cb.dataset.toggleItem);
+    if (!dbOk(await db.from('vision_board_checklist').update({ done: cb.checked }).eq('id', cb.dataset.toggleItem))) { cb.checked = !cb.checked; return; }
     const item = state.visionBoardChecklist.find(x => x.id === cb.dataset.toggleItem);
     if (item) item.done = cb.checked;
     renderVisionBoardDetail(b);
   });
   $$('[data-del-item]').forEach(x => x.onclick = async () => {
-    await db.from('vision_board_checklist').delete().eq('id', x.dataset.delItem);
+    if (!dbOk(await db.from('vision_board_checklist').delete().eq('id', x.dataset.delItem))) return;
     await loadAll(); renderView();
   });
   $('#vision-new-item').onkeydown = async e => {
     if (e.key !== 'Enter') return;
     const label = e.target.value.trim();
     if (!label) return;
-    await db.from('vision_board_checklist').insert({ board_id: b.id, label, sort_order: checklist.length });
+    if (!dbOk(await db.from('vision_board_checklist').insert({ board_id: b.id, label, sort_order: checklist.length }))) return;
     await loadAll(); renderView();
+    const again = $('#vision-new-item');
+    if (again) again.focus(); // keep typing the next to-do
   };
 
   const photoGrid = $('#vision-photo-grid');
@@ -1764,13 +1951,17 @@ function renderVisionBoardDetail(b) {
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
     toast('Uploading…');
+    let saved = 0, failedCount = 0;
     for (let idx = 0; idx < files.length; idx++) {
       try {
         const dataUrl = await resizeImageFile(files[idx]);
-        await db.from('vision_board_images').insert({ board_id: b.id, data_url: dataUrl, sort_order: images.length + idx });
-      } catch (err) { toast('One image failed to process'); }
+        const res = await db.from('vision_board_images').insert({ board_id: b.id, data_url: dataUrl, sort_order: images.length + idx });
+        if (res.error) failedCount++; else saved++;
+      } catch (err) { failedCount++; }
     }
     await loadAll(); renderView();
+    if (failedCount) toast(`${saved} photo${saved === 1 ? '' : 's'} added, ${failedCount} failed`, { error: true });
+    else toast(`${saved} photo${saved === 1 ? '' : 's'} added`);
   };
 }
 
@@ -1785,7 +1976,7 @@ function openPhotoViewer(img) {
   `);
   $('#delete-photo-btn').onclick = async () => {
     if (!confirm('Delete this photo?')) return;
-    await db.from('vision_board_images').delete().eq('id', img.id);
+    if (!dbOk(await db.from('vision_board_images').delete().eq('id', img.id))) return;
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -1807,8 +1998,8 @@ function renderSettings() {
               <td>${c.statement_day || '—'}</td>
               <td>${c.due_day || '—'}</td>
               <td style="text-align:right;">
-                <button class="icon-btn edit" data-edit-c="${c.id}">✎</button>
-                <button class="icon-btn" data-del-c="${c.id}">✕</button>
+                <button class="icon-btn edit" data-edit-c="${c.id}" title="Edit" aria-label="Edit">✎</button>
+                <button class="icon-btn" data-del-c="${c.id}" title="Delete" aria-label="Delete">✕</button>
               </td>
             </tr>`).join('')}
         </tbody>
@@ -1826,15 +2017,14 @@ function renderSettings() {
   $$('[data-edit-c]').forEach(b => b.onclick = () => openCardModal(state.cards.find(c => c.id === b.dataset.editC)));
   $$('[data-del-c]').forEach(b => b.onclick = async () => {
     if (!confirm('This will also delete this card\'s transactions and installments. Continue?')) return;
-    await db.from('credit_cards').delete().eq('id', b.dataset.delC);
+    if (!dbOk(await db.from('credit_cards').delete().eq('id', b.dataset.delC), 'Card deleted')) return;
     await loadAll(); renderView();
   });
   $('#change-pw-btn').onclick = async () => {
     const pw = $('#new-pw').value;
     if (pw.length < 4) { toast('Password too short'); return; }
     const hash = await sha256(pw);
-    await db.from('app_settings').update({ value: hash }).eq('key', 'password_hash');
-    toast('Password updated');
+    if (!dbOk(await db.from('app_settings').update({ value: hash }).eq('key', 'password_hash'), 'Password updated')) return;
     $('#new-pw').value = '';
   };
 }
@@ -1878,7 +2068,7 @@ function openCardModal(card) {
     let error;
     if (isEdit) ({ error } = await db.from('credit_cards').update(payload).eq('id', c.id));
     else ({ error } = await db.from('credit_cards').insert({ ...payload, sort_order: c.sort_order }));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -1959,8 +2149,8 @@ function renderJustineSummary() {
       <div class="ph">
         <div><span class="tag">${monthLabel}</span></div>
         <div>
-          <button class="icon-btn edit" data-edit-m="${m.id}" title="Edit">✎</button>
-          <button class="icon-btn" data-archive-m="${m.id}" title="Archive">📦</button>
+          <button class="icon-btn edit" data-edit-m="${m.id}" title="Edit" aria-label="Edit">✎</button>
+          <button class="icon-btn" data-archive-m="${m.id}" title="Archive" aria-label="Archive">📦</button>
         </div>
       </div>
       <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
@@ -1971,8 +2161,8 @@ function renderJustineSummary() {
       ${justineBillsForMonth(m.id).map(b => `
         <div class="line">
           <span class="lbl">${escapeHtml(b.label)}
-            <button class="icon-btn edit" data-edit-bill="${b.id}" style="width:20px;height:20px;font-size:10px;margin-left:4px;">✎</button>
-            <button class="icon-btn" data-del-bill="${b.id}" style="width:20px;height:20px;font-size:10px;">✕</button>
+            <button class="icon-btn edit" data-edit-bill="${b.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
+            <button class="icon-btn" data-del-bill="${b.id}" title="Delete" aria-label="Delete">✕</button>
           </span>
           <span class="val">${PESO(b.amount)}</span>
         </div>`).join('')}
@@ -1988,17 +2178,15 @@ function renderJustineSummary() {
   });
   $$('[data-notes-for]').forEach(t => {
     t.onblur = async () => {
-      await db.from('justine_months').update({ notes: t.value }).eq('id', t.dataset.notesFor);
       const m = state.justineMonths.find(x => x.id === t.dataset.notesFor);
+      if (m && t.value === (m.notes || '')) return; // nothing changed
+      if (!dbOk(await db.from('justine_months').update({ notes: t.value }).eq('id', t.dataset.notesFor), 'Notes saved')) return;
       if (m) m.notes = t.value; // keep local state in sync without a full reload/re-render
     };
   });
   $$('[data-edit-m]').forEach(b => b.onclick = () => openJustineMonthModal(state.justineMonths.find(m => m.id === b.dataset.editM)));
   wireRevealToggles();
-  $$('[data-archive-m]').forEach(b => b.onclick = async () => {
-    await db.from('justine_months').update({ archived: true }).eq('id', b.dataset.archiveM);
-    await loadAll(); renderView();
-  });
+  $$('[data-archive-m]').forEach(b => b.onclick = () => setArchived('justine_months', b.dataset.archiveM, true, 'Month'));
   $$('[data-add-bill]').forEach(b => b.onclick = () => openJustineBillModal(null, b.dataset.addBill));
   $$('[data-edit-bill]').forEach(b => b.onclick = () => {
     const bill = state.justineBills.find(x => x.id === b.dataset.editBill);
@@ -2006,7 +2194,7 @@ function renderJustineSummary() {
   });
   $$('[data-del-bill]').forEach(b => b.onclick = async () => {
     if (!confirm('Delete this bill?')) return;
-    await db.from('justine_bills').delete().eq('id', b.dataset.delBill);
+    if (!dbOk(await db.from('justine_bills').delete().eq('id', b.dataset.delBill))) return;
     await loadAll(); renderView();
   });
 
@@ -2020,16 +2208,13 @@ function renderJustineSummary() {
       el.innerHTML = `
         <div class="ph">
           <div><span class="tag">${monthLabel}</span></div>
-          <div><button class="icon-btn edit" data-restore-m="${m.id}" title="Restore">♻️</button></div>
+          <div><button class="icon-btn edit" data-restore-m="${m.id}" title="Restore" aria-label="Restore">♻️</button></div>
         </div>
         <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(m.paycheck_budget)}</span></div>
       `;
       ag.appendChild(el);
     });
-    $$('[data-restore-m]').forEach(b => b.onclick = async () => {
-      await db.from('justine_months').update({ archived: false }).eq('id', b.dataset.restoreM);
-      await loadAll(); renderView();
-    });
+    $$('[data-restore-m]').forEach(b => b.onclick = () => setArchived('justine_months', b.dataset.restoreM, false, 'Month'));
   }
 }
 
@@ -2066,7 +2251,7 @@ function openJustineMonthModal(month) {
     let error;
     if (isEdit) ({ error } = await db.from('justine_months').update(payload).eq('id', m.id));
     else ({ error } = await db.from('justine_months').insert(payload));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
@@ -2091,7 +2276,7 @@ function openJustineBillModal(bill, monthId) {
     let error;
     if (isEdit) ({ error } = await db.from('justine_bills').update(payload).eq('id', b.id));
     else ({ error } = await db.from('justine_bills').insert(payload));
-    if (error) { toast(error.message); return; }
+    if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
 }
