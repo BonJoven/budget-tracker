@@ -745,6 +745,12 @@ function openPeriodModal(period, defaultDate, defaultType) {
 
 /* ---------------- TRANSACTIONS VIEW ---------------- */
 
+// Which pay period a card's bill is settled in: '15th', '30th', or blank/'both'
+// (shows in every period - also the fallback before the pay_period column exists).
+function cardPaidInPeriod(card, period) {
+  return !card.pay_period || card.pay_period === 'both' || card.pay_period === period.period_type;
+}
+
 function renderTransactions() {
   const main = $('#main');
   const activePeriods = state.periods.filter(p => !p.archived);
@@ -899,12 +905,18 @@ function renderTransactions() {
   state.cards.filter(c => !c.archived).forEach(card => {
     const rows = state.transactions.filter(t => t.card_id === card.id && t.period_id === period.id);
     const virtualRows = virtualEntriesForPeriod(period.id).filter(e => e.card_id === card.id);
+    // A card only gets a section in the period it's actually paid in (its
+    // "Paid on" setting). If something IS recorded against it in the other
+    // period, the section still shows (flagged) so nothing that counts toward
+    // the Summary totals is ever hidden.
+    const offCycle = !cardPaidInPeriod(card, period);
+    if (offCycle && !rows.length && !virtualRows.length) return;
     const total = rows.reduce((s, t) => s + Number(t.amount), 0) + virtualRows.reduce((s, e) => s + e.amount, 0);
     const sec = document.createElement('div');
     sec.className = 'section-card';
     sec.innerHTML = `
       <div class="sh">
-        <h3><span class="card-chip"><span class="sw" style="background:${card.color}"></span>${card.name}${statementBadge(card, period.period_date)}</span></h3>
+        <h3><span class="card-chip"><span class="sw" style="background:${card.color}"></span>${card.name}${statementBadge(card, period.period_date)}${offCycle ? ` <span class="synced-badge" style="color:var(--red);background:rgba(244,117,111,.15);" title="This card is set to be paid on the ${card.pay_period}, but it has entries in this period">⚠ normally a ${card.pay_period} card</span>` : ''}</span></h3>
         <div style="display:flex;align-items:center;gap:14px;">
           <span class="total">${PESO(total)}</span>
           <button class="btn secondary" data-add="${card.id}" style="padding:6px 12px;font-size:13px;">+ Add</button>
@@ -1159,23 +1171,55 @@ function renderInstallmentsDashboard(list) {
       </div>`).join('');
   }
 
-  // Payoff timeline - each active plan as a bar from today to its end date
+  // Payoff timeline - one row per month, listing the plans whose LAST payment
+  // falls in that month, how much monthly obligation that frees up, and what
+  // you're still carrying per month afterward (the bar shrinks toward zero).
   const timelineItems = activeMetrics.filter(x => x.m.endDate).sort((a, b) => a.m.endDate.localeCompare(b.m.endDate));
   let timelineHtml = `<div class="empty-state" style="padding:16px;font-size:13px;">Nothing active to project.</div>`;
   if (timelineItems.length) {
     const today = new Date(); today.setHours(0, 0, 0, 0);
-    const maxD = new Date(timelineItems[timelineItems.length - 1].m.endDate + 'T00:00:00');
-    const totalSpan = Math.max(maxD - today, 1);
-    timelineHtml = timelineItems.map(({ i, m }) => {
-      const end = new Date(m.endDate + 'T00:00:00');
-      const pct = Math.min(100, Math.max(3, ((end - today) / totalSpan) * 100));
+    const startingMonthly = timelineItems.reduce((s, x) => s + x.m.monthly, 0);
+    const byEndMonth = new Map();
+    timelineItems.forEach(x => {
+      const mk = monthKey(x.m.endDate);
+      if (!byEndMonth.has(mk)) byEndMonth.set(mk, []);
+      byEndMonth.get(mk).push(x);
+    });
+    let stillCarrying = startingMonthly;
+    const monthRows = Array.from(byEndMonth.keys()).sort().map(mk => {
+      const plans = byEndMonth.get(mk);
+      const freed = plans.reduce((s, x) => s + x.m.monthly, 0);
+      stillCarrying = Math.max(stillCarrying - freed, 0);
+      const isLast = stillCarrying < 0.005;
+      const [y, mo] = mk.split('-').map(Number);
+      const monthsAway = (y - today.getFullYear()) * 12 + (mo - 1 - today.getMonth());
+      const awayLabel = monthsAway <= 0 ? 'this month' : monthsAway === 1 ? 'next month' : `in ${monthsAway} months`;
+      const leftPct = startingMonthly > 0 ? (stillCarrying / startingMonthly) * 100 : 0;
       return `
-        <div class="timeline-row">
-          <div class="timeline-label">${escapeHtml(i.name)} <span style="color:var(--text-dim);font-size:11px;">${m.card ? m.card.name : 'General Ledger'}</span></div>
-          <div class="timeline-track"><div class="timeline-fill" style="width:${pct}%;background:${m.card ? m.card.color : 'var(--blue)'}"></div></div>
-          <div class="timeline-date">${end.toLocaleDateString('en-PH', { month: 'short', year: 'numeric' })}</div>
+        <div class="payoff-month${isLast ? ' payoff-last' : ''}">
+          <div class="payoff-when">
+            <div class="payoff-mon">${new Date(y, mo - 1, 1).toLocaleDateString('en-PH', { month: 'short', year: 'numeric' })}</div>
+            <div class="payoff-away">${awayLabel}</div>
+          </div>
+          <div class="payoff-plans">
+            ${plans.map(({ i, m }) => `
+              <span class="payoff-chip">
+                <span class="sw" style="background:${m.card ? m.card.color : 'var(--blue)'}"></span>
+                <span class="payoff-chip-name">${escapeHtml(i.name)}</span>
+                <span class="payoff-chip-bank">${m.card ? escapeHtml(m.card.name) : 'General Ledger'}</span>
+                <span class="payoff-chip-amt">${PESO(m.monthly)}</span>
+              </span>`).join('')}
+          </div>
+          <div class="payoff-impact">
+            <div class="payoff-freed">+${PESO(freed)}/mo freed</div>
+            <div class="payoff-track"><div class="payoff-fill" style="width:${leftPct}%"></div></div>
+            <div class="payoff-left">${isLast ? '🎉 Debt-free' : `${PESO(stillCarrying)}/mo still to pay`}</div>
+          </div>
         </div>`;
     }).join('');
+    timelineHtml = `
+      <div class="payoff-start">Today: <b>${PESO(startingMonthly)}/mo</b> across ${timelineItems.length} active plan${timelineItems.length === 1 ? '' : 's'}</div>
+      ${monthRows}`;
   }
 
   wrap.innerHTML = `
@@ -1217,7 +1261,7 @@ function renderInstallmentsDashboard(list) {
     </div>
 
     <div class="dash-timeline">
-      <h4>Payoff timeline <span>when each active plan finishes</span></h4>
+      <h4>Payoff timeline <span>what finishes each month, and what that frees up</span></h4>
       ${timelineHtml}
     </div>
   `;
@@ -1797,7 +1841,10 @@ function renderSettings() {
 
 function openCardModal(card) {
   const isEdit = !!card;
-  const c = card || { name: '', color: '#5b9df9', statement_day: '', due_day: '', sort_order: state.cards.length + 1 };
+  const c = card || { name: '', color: '#5b9df9', statement_day: '', due_day: '', pay_period: '30th', sort_order: state.cards.length + 1 };
+  // Only offer/save "Paid on" once migration_card_pay_period.sql has been run,
+  // so saving a card never fails on a database that doesn't have the column yet.
+  const hasPayPeriodCol = state.cards.some(x => 'pay_period' in x);
   showModal(`
     <h3>${isEdit ? 'Edit' : 'Add'} card</h3>
     <div class="field-row">
@@ -1808,7 +1855,17 @@ function openCardModal(card) {
       <div class="field"><label>Statement day (optional)</label><input type="text" id="f-sd" value="${c.statement_day || ''}" placeholder="e.g. 27th"></div>
       <div class="field"><label>Due day (optional)</label><input type="text" id="f-dd" value="${c.due_day || ''}" placeholder="e.g. 15th"></div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);">Due day shows up next to the "statement in" badge once that statement has actually arrived this month.</p>
+    ${hasPayPeriodCol ? `
+    <div class="field-row">
+      <div class="field"><label>Paid on</label>
+        <select id="f-pp">
+          <option value="15th" ${c.pay_period === '15th' ? 'selected' : ''}>15th period only</option>
+          <option value="30th" ${c.pay_period === '30th' ? 'selected' : ''}>30th period only</option>
+          <option value="both" ${!c.pay_period || c.pay_period === 'both' ? 'selected' : ''}>Both periods</option>
+        </select>
+      </div>
+    </div>` : ''}
+    <p style="font-size:12px;color:var(--text-dim);">Due day shows up next to the "statement in" badge once that statement has actually arrived this month.${hasPayPeriodCol ? ' "Paid on" decides which period this card appears under on the Transactions tab.' : ''}</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
@@ -1816,6 +1873,7 @@ function openCardModal(card) {
   `);
   $('#modal-save').onclick = async () => {
     const payload = { name: $('#f-name').value.trim(), color: $('#f-color').value, statement_day: $('#f-sd').value.trim(), due_day: $('#f-dd').value.trim() };
+    if (hasPayPeriodCol) payload.pay_period = $('#f-pp').value;
     if (!payload.name) { toast('Name required'); return; }
     let error;
     if (isEdit) ({ error } = await db.from('credit_cards').update(payload).eq('id', c.id));
