@@ -82,7 +82,10 @@ create table installment_schedule (
   installment_id uuid not null references installments(id) on delete cascade,
   due_date date not null,
   amount numeric not null,
-  wifey_share numeric not null default 0
+  wifey_share numeric not null default 0,
+  is_fee_row boolean not null default false,   -- the fee is added on top of this row at display time
+  paid boolean,                                -- NULL = paid once the date passes; true/false = set by hand
+  unique (installment_id, due_date)
 );
 
 -- Justine's simpler monthly budget: one row per calendar month
