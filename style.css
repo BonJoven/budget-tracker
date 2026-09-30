@@ -619,3 +619,87 @@ tr:hover td{background:var(--surface2);}
 @media(max-width:700px){
   .vision-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));}
 }
+
+/* ============================================================
+   UX pass: feedback, quick add, tap targets, collapsing
+   ============================================================ */
+
+/* Toast: error + undo variants */
+.toast{max-width:calc(100vw - 40px);box-shadow:0 8px 24px rgba(0,0,0,.35);}
+.toast.error{border-color:var(--red);color:var(--red);}
+.toast-undo{
+  margin-left:12px;background:transparent;border:1px solid var(--gold);color:var(--gold);
+  padding:3px 10px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;
+}
+.toast-undo:hover{background:rgba(227,177,88,.15);}
+
+/* Icon buttons: breathing room so Edit and Delete aren't touching */
+.icon-btn{vertical-align:middle;}
+.icon-btn + .icon-btn{margin-left:6px;}
+.icon-btn:focus-visible,.btn:focus-visible,.pg-toggle:focus-visible{outline:2px solid var(--gold);outline-offset:2px;}
+.btn:disabled{opacity:.5;cursor:default;}
+
+/* Quick-add row under each card on the Transactions tab */
+.quick-add{
+  display:grid;grid-template-columns:1fr 130px auto;gap:8px;
+  margin-top:12px;padding-top:12px;border-top:1px dashed var(--border);
+}
+.quick-add input{
+  background:var(--surface2);border:1px solid var(--border);color:var(--text);
+  padding:8px 10px;border-radius:8px;font-size:14px;font-family:inherit;min-width:0;
+}
+.quick-add input:focus{outline:2px solid var(--gold);}
+.quick-add [data-quick-amt]{text-align:right;}
+.quick-add .btn{padding:6px 12px;font-size:13px;}
+
+/* Summary: older months folded to one line */
+.pg-toggle{
+  display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+  width:100%;background:transparent;border:none;color:var(--text);
+  padding:0;cursor:pointer;font-family:inherit;text-align:left;
+}
+.period-group-card.collapsed{padding:12px 16px;margin-bottom:10px;}
+.period-group-card.collapsed .pg-header{margin-bottom:0;font-size:14px;}
+.period-group-card.collapsed:hover{border-color:var(--text-dim);}
+.pg-mini{font-size:12.5px;color:var(--text-dim);font-variant-numeric:tabular-nums;}
+.pg-mini b{color:var(--text);}
+.pg-sep{margin:0 8px;}
+
+/* Period modal: carry over previous savings */
+.carry-btn{
+  background:rgba(227,177,88,.12);border:1px solid var(--gold);color:var(--gold);
+  padding:7px 12px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;
+  margin-bottom:10px;
+}
+.carry-btn:hover{background:rgba(227,177,88,.2);}
+.carry-note{font-size:12px;color:var(--green);margin-bottom:10px;}
+
+/* Installments: the extra stats fold away below the plan list */
+.dash-more{
+  background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:0 16px;margin-bottom:22px;
+}
+.dash-more > summary{
+  cursor:pointer;padding:14px 0;font-family:'Space Grotesk',sans-serif;font-size:13.5px;font-weight:700;
+}
+.dash-more[open] > summary{border-bottom:1px solid var(--border);margin-bottom:16px;}
+
+@media (max-width: 768px) {
+  /* Solid top bar so the menu button never sits on top of content */
+  #app.active::after{
+    content:'Household Budget';
+    position:fixed;top:0;left:0;right:0;height:56px;z-index:40;
+    background:var(--bg);border-bottom:1px solid var(--border);
+    padding-left:64px;line-height:56px;
+    font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:15px;
+  }
+  #mobile-menu-btn{top:9px;}
+  #main{padding-top:72px;}
+  /* Finger-sized tap targets */
+  .icon-btn{width:34px;height:34px;font-size:14px;}
+  .icon-btn + .icon-btn{margin-left:8px;}
+  .quick-add{grid-template-columns:1fr 96px auto;}
+  .quick-add input{font-size:16px;} /* stops iOS zooming in on focus */
+  .pg-mini{width:100%;}
+  .toast{left:16px;right:16px;bottom:16px;}
+}
