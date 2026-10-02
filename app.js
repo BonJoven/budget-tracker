@@ -277,7 +277,7 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments, visionBoards, visionBoardChecklist, visionBoardImages] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments, visionBoards, visionBoardChecklist, visionBoardImages, installmentItems] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: true }),
     db.from('transactions').select('*'),
@@ -290,6 +290,7 @@ async function loadAll() {
     db.from('vision_boards').select('*').order('sort_order'),
     db.from('vision_board_checklist').select('*').order('sort_order'),
     db.from('vision_board_images').select('*').order('sort_order'),
+    db.from('installment_items').select('*').order('sort_order'),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
@@ -303,6 +304,9 @@ async function loadAll() {
   state.visionBoards = visionBoards.data || [];
   state.visionBoardChecklist = visionBoardChecklist.data || [];
   state.visionBoardImages = visionBoardImages.data || [];
+  // The breakdown feature switches itself on once migration_installment_items.sql has been run.
+  state.itemsTableOk = !installmentItems.error;
+  state.installmentItems = installmentItems.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
@@ -912,7 +916,19 @@ function openPeriodModal(period, defaultDate, defaultType) {
     if (isEdit) ({ error } = await db.from('periods').update(payload).eq('id', p.id));
     else ({ error } = await db.from('periods').insert(payload));
     if (error) { toast(error.message, { error: true }); return; }
+    // A new 15th always gets its 30th too - Justine's 15th amount only counts
+    // on the 30th, so a month without one would silently drop it.
+    let added30 = false;
+    if (!isEdit && payload.period_type === '15th') {
+      const mk = monthKey(payload.period_date);
+      if (!state.periods.some(x => x.period_type === '30th' && monthKey(x.period_date) === mk)) {
+        const [y, m] = mk.split('-').map(Number);
+        const day30 = String(Math.min(30, new Date(y, m, 0).getDate())).padStart(2, '0');
+        added30 = dbOk(await db.from('periods').insert({ period_date: `${mk}-${day30}`, period_type: '30th', salary: 0, previous_savings: 0 }));
+      }
+    }
     closeModal(); await loadAll(); renderView();
+    if (added30) toast('15th added, plus an empty 30th for the same month');
   };
 }
 
@@ -1581,7 +1597,10 @@ function renderInstallments() {
         </div>
       </div>` : ''}
       <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
-        <button class="btn secondary" data-view-sched="${i.id}" style="padding:6px 12px;font-size:12px;">View schedule</button>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn secondary" data-view-sched="${i.id}" style="padding:6px 12px;font-size:12px;">View schedule</button>
+          ${itemsForInstallment(i.id).length ? `<button class="btn secondary" data-view-items="${i.id}" style="padding:6px 12px;font-size:12px;" title="See and copy the item breakdown">🧾 Breakdown (${itemsForInstallment(i.id).length})</button>` : ''}
+        </div>
         <div>
           ${i.archived ? `
             <button class="icon-btn edit" data-restore-i="${i.id}" title="Restore" aria-label="Restore">♻️</button>
@@ -1597,6 +1616,7 @@ function renderInstallments() {
   });
   $$('[data-edit-i]').forEach(b => b.onclick = () => openInstallModal(state.installments.find(x => x.id === b.dataset.editI)));
   $$('[data-view-sched]').forEach(b => b.onclick = () => openScheduleModal(state.installments.find(x => x.id === b.dataset.viewSched)));
+  $$('[data-view-items]').forEach(b => b.onclick = () => openBreakdownModal(state.installments.find(x => x.id === b.dataset.viewItems)));
   $$('[data-archive-i]').forEach(b => b.onclick = () => setArchived('installments', b.dataset.archiveI, true, 'Installment'));
   $$('[data-restore-i]').forEach(b => b.onclick = () => setArchived('installments', b.dataset.restoreI, false, 'Installment'));
   $$('[data-del-i]').forEach(b => b.onclick = async () => {
@@ -1688,6 +1708,73 @@ function openScheduleModal(inst) {
   };
 }
 
+function itemsForInstallment(installId) {
+  return (state.installmentItems || []).filter(x => x.installment_id === installId).sort((a, b) => a.sort_order - b.sort_order);
+}
+
+// Plain-text breakdown, ready to paste into Messenger / Viber / SMS.
+function breakdownText(inst) {
+  const items = itemsForInstallment(inst.id);
+  const card = state.cards.find(c => c.id === inst.card_id);
+  const schedule = scheduleForInstallment(inst.id);
+  const sharer = inst.owner === 'joven' ? shareHolder(inst) : 'Joven';
+  const total = items.reduce((s, x) => s + Number(x.amount), 0);
+  const monthLabel = d => new Date(d + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' });
+  const lines = [
+    `${inst.name}${card ? ` (${card.name} installment)` : ''}`,
+    ...items.map(x => `• ${x.label}: ${PESO(x.amount)} (${x.owner})`),
+    `Total: ${PESO(total)}`,
+  ];
+  const sharerAmt = items.filter(x => (x.owner || '').toLowerCase() === sharer.toLowerCase()).reduce((s, x) => s + Number(x.amount), 0);
+  if (sharerAmt > 0 && total > 0) {
+    const lifetime = schedule.reduce((s, r) => s + totalWifeyShareForRow(inst, r), 0);
+    const paid = schedule.filter(isRowPaid).reduce((s, r) => s + totalWifeyShareForRow(inst, r), 0);
+    const monthsLeft = schedule.filter(r => !isRowPaid(r)).length;
+    lines.push('', `${possessive(sharer)} part: ${PESO(sharerAmt)} (${(sharerAmt / total * 100).toFixed(1)}%)`);
+    if (schedule.length) {
+      lines.push(`${PESO(inst.wifey_monthly_share)}/month × ${schedule.length} months (${monthLabel(schedule[0].due_date)} to ${monthLabel(schedule[schedule.length - 1].due_date)})`);
+      if (Number(inst.wifey_fee_share) > 0) lines.push(`+ ${PESO(inst.wifey_fee_share)} of the processing fee on the first payment`);
+      lines.push(`Total: ${PESO(lifetime)} · Paid so far: ${PESO(paid)} · Remaining: ${PESO(lifetime - paid)}${monthsLeft ? ` (${monthsLeft} month${monthsLeft === 1 ? '' : 's'} left)` : ''}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function openBreakdownModal(inst) {
+  const items = itemsForInstallment(inst.id);
+  const sharer = inst.owner === 'joven' ? shareHolder(inst) : 'Joven';
+  const total = items.reduce((s, x) => s + Number(x.amount), 0);
+  const text = breakdownText(inst);
+  showModal(`
+    <h3>${escapeHtml(inst.name)} — breakdown</h3>
+    <table>
+      <thead><tr><th>Item</th><th>Owner</th><th class="num">Amount</th></tr></thead>
+      <tbody>
+        ${items.map(x => `<tr><td>${escapeHtml(x.label)}</td><td>${escapeHtml(x.owner)}</td><td class="num">${PESO(x.amount)}</td></tr>`).join('')}
+        <tr><td colspan="2" style="font-weight:700;">Total</td><td class="num" style="font-weight:700;">${PESO(total)}</td></tr>
+      </tbody>
+    </table>
+    <label style="display:block;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;margin:16px 0 6px;">What gets copied</label>
+    <textarea id="breakdown-text" readonly class="breakdown-text">${escapeHtml(text)}</textarea>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Close</button>
+      <button class="btn" id="copy-breakdown-btn">📋 Copy for ${escapeHtml(sharer)}</button>
+    </div>
+  `);
+  const ta = $('#breakdown-text');
+  ta.style.height = Math.min(ta.scrollHeight + 4, 320) + 'px';
+  $('#copy-breakdown-btn').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Copied — paste it in Messenger or Viber');
+    } catch (e) {
+      // Older browsers / no clipboard permission: select it so Cmd/Ctrl+C works.
+      ta.focus(); ta.select();
+      toast('Press Cmd+C (or Ctrl+C) to copy the selected text');
+    }
+  };
+}
+
 function openInstallModal(item) {
   const isEdit = !!item;
   const i = item || {
@@ -1725,6 +1812,7 @@ function openInstallModal(item) {
     <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">Justine's share goes into her total (paid on the 30th). Anyone else's share shows up automatically as money in on the period it's due.</p>` : ''}
     <div class="field-row">
       <div class="field"><label><span data-sharer-label>${counterpartLabel}</span> share of the fee</label><input type="number" step="0.01" id="f-feeshare" value="${i.wifey_fee_share}"></div>
+    </div>
     <div class="field-row">
       <div class="field"><label>Monthly amount</label><input type="number" step="0.01" id="f-monthly" value="${i.monthly_amount}"></div>
       <div class="field"><label># of months</label><input type="number" id="f-months" value="${i.num_months}"></div>
@@ -1734,16 +1822,98 @@ function openInstallModal(item) {
       <div class="field"><label>Start date</label><input type="date" id="f-start" value="${i.start_date}"></div>
       <div class="field"><label>Payer / note</label><input type="text" id="f-payer" value="${i.payer ? escapeHtml(i.payer) : ''}" placeholder="e.g. Justine"></div>
     </div>
+    ${state.itemsTableOk ? `
+    <div class="items-block">
+      <div class="items-head">Breakdown <span>optional · what's in this plan and whose it is</span></div>
+      <div id="items-rows"></div>
+      <datalist id="item-owner-list"></datalist>
+      <button type="button" class="btn secondary" id="add-item-btn" style="padding:6px 12px;font-size:12px;">+ Add item</button>
+      <div id="items-summary"></div>
+    </div>` : ''}
     ${isEdit ? `<p style="font-size:12px;color:var(--text-dim);">Changing amount/months/start date regenerates the schedule and resets any per-period edits you made in "View schedule".</p>` : ''}
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
     </div>
   `);
+
+  // ---- Breakdown: items, each with an owner. The shared person's slice of
+  // the item total sets their monthly + fee share automatically. ----
+  const selfName = state.profile === 'joven' ? 'Joven' : 'Justine';
+  const currentSharer = () => hasShareWithCol ? ($('#f-sharewith').value.trim() || 'Justine') : holderNow;
+  let items = state.itemsTableOk && isEdit ? itemsForInstallment(i.id).map(x => ({ label: x.label, owner: x.owner, amount: x.amount })) : [];
+  const renderItemRows = () => {
+    if (!state.itemsTableOk) return;
+    $('#item-owner-list').innerHTML = [...new Set([selfName, currentSharer(), ...knownSharers])].map(n => `<option value="${escapeHtml(n)}">`).join('');
+    $('#items-rows').innerHTML = items.map((it, idx) => `
+      <div class="item-row">
+        <input type="text" data-item="${idx}" data-k="label" value="${escapeHtml(it.label || '')}" placeholder="Item" aria-label="Item">
+        <input type="text" data-item="${idx}" data-k="owner" value="${escapeHtml(it.owner || '')}" list="item-owner-list" placeholder="Owner" aria-label="Owner">
+        <input type="number" step="0.01" data-item="${idx}" data-k="amount" value="${it.amount ?? ''}" placeholder="Amount" aria-label="Amount">
+        <button type="button" class="icon-btn" data-del-item-row="${idx}" title="Remove item" aria-label="Remove item">✕</button>
+      </div>`).join('');
+    $$('#items-rows input').forEach(inp => inp.oninput = () => {
+      const it = items[+inp.dataset.item];
+      it[inp.dataset.k] = inp.dataset.k === 'amount' ? inp.value : inp.value;
+      updateItemsSummary(true);
+    });
+    $$('[data-del-item-row]').forEach(b => b.onclick = () => { items.splice(+b.dataset.delItemRow, 1); renderItemRows(); updateItemsSummary(true); });
+  };
+  const updateItemsSummary = (applyShares) => {
+    if (!state.itemsTableOk) return;
+    const wrap = $('#items-summary');
+    const filled = items.filter(it => Number(it.amount) > 0);
+    if (!filled.length) { wrap.innerHTML = ''; return; }
+    const sharer = currentSharer();
+    const total = filled.reduce((s2, it) => s2 + Number(it.amount), 0);
+    const byOwner = new Map();
+    filled.forEach(it => {
+      const name = (it.owner || '').trim() || selfName;
+      const key = name.toLowerCase();
+      if (!byOwner.has(key)) byOwner.set(key, { name, amount: 0 });
+      byOwner.get(key).amount += Number(it.amount);
+    });
+    const sharerAmt = (byOwner.get(sharer.toLowerCase()) || { amount: 0 }).amount;
+    const ratio = total > 0 ? sharerAmt / total : 0;
+    const monthly = +$('#f-monthly').value || 0;
+    const fee = +$('#f-fee').value || 0;
+    const shareMonthly = round2(monthly * ratio);
+    const shareFee = round2(fee * ratio);
+    if (applyShares) {
+      $('#f-monthlyshare').value = shareMonthly;
+      $('#f-feeshare').value = shareFee;
+    }
+    const principal = +$('#f-principal').value || 0;
+    const diff = round2(total - principal);
+    const strangers = [...byOwner.values()].filter(o => ![selfName.toLowerCase(), sharer.toLowerCase()].includes(o.name.toLowerCase()));
+    wrap.innerHTML = `
+      <div class="items-total">
+        <span>Items total <b>${PESO(total)}</b></span>
+        ${principal ? (Math.abs(diff) < 0.01 ? `<span class="ok">✓ matches principal</span>` : `<span class="warn">${PESO(Math.abs(diff))} ${diff < 0 ? 'short of' : 'over'} principal</span>`) : ''}
+      </div>
+      <div class="items-owners">${[...byOwner.values()].map(o => `<span>${escapeHtml(o.name)} <b>${PESO(o.amount)}</b> (${(o.amount / total * 100).toFixed(1)}%)</span>`).join('')}</div>
+      <div class="items-share">→ ${escapeHtml(possessive(sharer))} share: <b>${PESO(shareMonthly)}/mo</b>${fee ? ` + <b>${PESO(shareFee)}</b> of the fee` : ''} <span>(filled in above — you can still type over it)</span></div>
+      ${strangers.length ? `<div class="warn" style="margin-top:6px;">Only ${escapeHtml(sharer)}'s items count toward the share — ${strangers.map(o => escapeHtml(o.name)).join(', ')} ${strangers.length === 1 ? "isn't" : "aren't"} this plan's "Shared with".</div>` : ''}`;
+  };
+  if (state.itemsTableOk) {
+    $('#add-item-btn').onclick = () => {
+      items.push({ label: '', owner: items.length ? '' : currentSharer(), amount: '' });
+      renderItemRows();
+      const rows = $$('#items-rows .item-row');
+      rows[rows.length - 1].querySelector('input').focus();
+    };
+    ['#f-monthly', '#f-fee'].forEach(sel => $(sel).addEventListener('input', () => updateItemsSummary(true)));
+    $('#f-principal').addEventListener('input', () => updateItemsSummary(false));
+    renderItemRows();
+    updateItemsSummary(false);
+  }
+
   if (hasShareWithCol) {
     $('#f-sharewith').oninput = () => {
       const name = $('#f-sharewith').value.trim() || 'Justine';
       $$('[data-sharer-label]').forEach(el => el.textContent = possessive(name));
+      renderItemRows();
+      updateItemsSummary(true);
     };
   }
   $('#modal-save').onclick = async () => {
@@ -1791,6 +1961,15 @@ function openInstallModal(item) {
         .update({ wifey_share: payload.wifey_monthly_share })
         .eq('installment_id', i.id)
         .eq('wifey_share', Number(i.wifey_monthly_share || 0)));
+    }
+    if (state.itemsTableOk && savedId) {
+      // Replace the breakdown wholesale - simplest way to keep order and edits in sync.
+      const rows = items
+        .filter(it => (it.label || '').trim() || Number(it.amount))
+        .map((it, idx) => ({ installment_id: savedId, label: (it.label || '').trim() || 'Item', owner: (it.owner || '').trim() || selfName, amount: Number(it.amount) || 0, sort_order: idx }));
+      const had = itemsForInstallment(savedId).length;
+      if (had && !dbOk(await db.from('installment_items').delete().eq('installment_id', savedId))) return;
+      if (rows.length && !dbOk(await db.from('installment_items').insert(rows))) return;
     }
     closeModal(); await loadAll(); renderView();
   };
