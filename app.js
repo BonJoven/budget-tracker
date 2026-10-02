@@ -412,6 +412,17 @@ function totalWifeyShareForRow(inst, row) {
   return Number(row.wifey_share || 0) + (row.is_fee_row ? Number(inst.wifey_fee_share || 0) : 0);
 }
 
+// Who pays back the shared part of one of Joven's installments ("Shared with"
+// on the installment). Blank = Justine - every plan made before this field
+// existed was shared with her.
+function shareHolder(inst) {
+  return (inst.share_with || '').trim() || 'Justine';
+}
+function isJustineShare(inst) {
+  return shareHolder(inst).toLowerCase() === 'justine';
+}
+const possessive = name => name + (/s$/i.test(name) ? "'" : "'s");
+
 // Joven's own installments surface automatically as a pinned, read-only
 // "payment plan" row on the matching card + period, sourced live from the
 // schedule - no manual re-entry needed. (Justine's installments are kept
@@ -426,6 +437,8 @@ function virtualEntriesForPeriod(periodId) {
           description: inst.name,
           amount: totalAmountForRow(inst, row),
           wifey_share: totalWifeyShareForRow(inst, row),
+          holder: shareHolder(inst),
+          toJustine: isJustineShare(inst),
           kind: 'payment_plan',
           card_id: inst.card_id,
           installmentId: inst.id,
@@ -474,6 +487,8 @@ function generalLedgerInstallmentEntriesForPeriod(periodId) {
           description: inst.name,
           amount: totalAmountForRow(inst, row),
           wifey_share: totalWifeyShareForRow(inst, row),
+          holder: shareHolder(inst),
+          toJustine: isJustineShare(inst),
           installmentId: inst.id,
           virtual: true,
         });
@@ -561,13 +576,31 @@ function wifeyTotalForPeriod(periodId) {
   const real = state.transactions
     .filter(t => t.period_id === periodId)
     .reduce((s, t) => s + Number(t.wifey_share || 0), 0);
-  const virtual = virtualEntriesForPeriod(periodId).reduce((s, e) => s + e.wifey_share, 0);
-  const glInstallments = generalLedgerInstallmentEntriesForPeriod(periodId).reduce((s, e) => s + e.wifey_share, 0);
+  // Card-pinned plans here; General Ledger plans (no card) come from the line
+  // below - virtualEntriesForPeriod returns both, so filtering by card avoids
+  // counting a General Ledger plan's share twice.
+  const virtual = virtualEntriesForPeriod(periodId).filter(e => e.card_id && e.toJustine).reduce((s, e) => s + e.wifey_share, 0);
+  const glInstallments = generalLedgerInstallmentEntriesForPeriod(periodId).filter(e => e.toJustine).reduce((s, e) => s + e.wifey_share, 0);
   const adjustments = state.wifeyAdjustments
     .filter(a => a.period_id === periodId)
     .reduce((s, a) => s + Number(a.amount), 0);
   const sharedLedger = justineSharedLedgerEntriesForPeriod(periodId).reduce((s, e) => s + e.amount, 0);
   return real + virtual + glInstallments + adjustments + sharedLedger;
+}
+
+// Shares owed by anyone other than Justine (Mama, JP, ...) on Joven's
+// installments. Each person's share lands as money in on the period the
+// payment is due, one line per person.
+function otherShareIncomeForPeriod(periodId) {
+  const byPerson = new Map();
+  virtualEntriesForPeriod(periodId).filter(e => !e.toJustine && e.wifey_share > 0).forEach(e => {
+    const key = e.holder.toLowerCase();
+    if (!byPerson.has(key)) byPerson.set(key, { person: e.holder, amount: 0, plans: [] });
+    const g = byPerson.get(key);
+    g.amount += e.wifey_share;
+    g.plans.push(`${e.description}: ${PESO(e.wifey_share)}`);
+  });
+  return [...byPerson.values()].sort((a, b) => a.person.localeCompare(b.person));
 }
 
 function periodTotals(period) {
@@ -581,10 +614,12 @@ function periodTotals(period) {
     wifeyCounted = wifeyAmount + (p15 ? wifeyTotalForPeriod(p15.id) : 0);
   }
   const extraIncome = incomeItemsForPeriod(period.id).reduce((s, i) => s + Number(i.amount), 0);
-  const income = Number(period.salary) + Number(period.previous_savings) + wifeyCounted + extraIncome;
+  const otherShares = otherShareIncomeForPeriod(period.id);
+  const otherShareIncome = otherShares.reduce((s, o) => s + o.amount, 0);
+  const income = Number(period.salary) + Number(period.previous_savings) + wifeyCounted + extraIncome + otherShareIncome;
   const outflow = cardTotal + generalLedgerInstallmentTotalForPeriod(period.id);
   const savings = income - outflow;
-  return { cardTotal, income, outflow, savings, extraIncome, wifeyAmount, wifeyCounted };
+  return { cardTotal, income, outflow, savings, extraIncome, wifeyAmount, wifeyCounted, otherShares, otherShareIncome };
 }
 
 /* ---------------- SUMMARY VIEW ---------------- */
@@ -637,27 +672,39 @@ function renderSummary() {
             <button class="icon-btn" data-archive="${p.id}" title="Archive" aria-label="Archive">📦</button>
           </div>
         </div>
-        <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
-        <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
-        <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span>${p.period_type === '15th' ? `<span class="synced-badge" style="color:var(--text-dim);background:rgba(141,149,171,.14);" title="She pays on the 30th, so this is shown for reference only - it's added to the 30th's savings instead">not counted · paid on 30th</span>` : ''}</span><span class="val"${p.period_type === '15th' ? ' style="color:var(--text-dim);font-weight:400;"' : ''}>${PESO(t.wifeyAmount)}</span></div>
-        ${combinedJustineLine}
-        ${incomeItemsForPeriod(p.id).map(item => `
-          <div class="line">
-            <span class="lbl">${escapeHtml(item.label)}
-              <button class="icon-btn edit" data-edit-income="${item.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
-              <button class="icon-btn" data-del-income="${item.id}" title="Delete" aria-label="Delete">✕</button>
-            </span>
-            <span class="val">${PESO(item.amount)}</span>
-          </div>`).join('')}
-        <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
-        <div class="line"><span class="lbl">General ledger <span class="synced-badge" title="Only counts general-ledger installments that add to your outflow - balance adjustments with Justine don't count here, see the Justine line for those">outflow only</span></span><span class="val">${PESO(generalLedgerInstallmentTotalForPeriod(p.id))}</span></div>
-        ${state.cards.map(c => {
-          const amt = cardTotalForPeriod(c.id, p.id);
-          if (!amt) return '';
-          return `<div class="line"><span class="lbl card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}${statementBadge(c, p.period_date)}</span><span class="val">${PESO(amt)}</span></div>`;
-        }).join('')}
-        <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.outflow)}</span></div>
-        <div class="line savings total"><span class="lbl">Savings</span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
+
+        <div class="flow flow-in">
+          <div class="flow-head">↓ Money in</div>
+          <div class="line"><span class="lbl">💰 Salary</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
+          <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
+          <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span>${p.period_type === '15th' ? `<span class="synced-badge" style="color:var(--text-dim);background:rgba(141,149,171,.14);" title="She pays on the 30th, so this is shown for reference only - it's added to the 30th's savings instead">not counted · paid on 30th</span>` : ''}</span><span class="val"${p.period_type === '15th' ? ' style="color:var(--text-dim);font-weight:400;"' : ''}>${PESO(t.wifeyAmount)}</span></div>
+          ${combinedJustineLine}
+          ${t.otherShares.map(o => `
+            <div class="line"><span class="lbl">${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span></span><span class="val">${PESO(o.amount)}</span></div>`).join('')}
+          ${incomeItemsForPeriod(p.id).map(item => `
+            <div class="line">
+              <span class="lbl">${escapeHtml(item.label)}
+                <button class="icon-btn edit" data-edit-income="${item.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
+                <button class="icon-btn" data-del-income="${item.id}" title="Delete" aria-label="Delete">✕</button>
+              </span>
+              <span class="val">${PESO(item.amount)}</span>
+            </div>`).join('')}
+          <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
+          <div class="line flow-total"><span class="lbl">Total in</span><span class="val">${PESO(t.income)}</span></div>
+        </div>
+
+        <div class="flow flow-out">
+          <div class="flow-head">↑ Money out</div>
+          <div class="line"><span class="lbl">General ledger <span class="synced-badge" title="Only counts general-ledger installments that add to your outflow - balance adjustments with Justine don't count here, see the Justine line for those">outflow only</span></span><span class="val">${PESO(generalLedgerInstallmentTotalForPeriod(p.id))}</span></div>
+          ${state.cards.map(c => {
+            const amt = cardTotalForPeriod(c.id, p.id);
+            if (!amt) return '';
+            return `<div class="line"><span class="lbl card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}${statementBadge(c, p.period_date)}</span><span class="val">${PESO(amt)}</span></div>`;
+          }).join('')}
+          <div class="line flow-total"><span class="lbl">Total out</span><span class="val">${PESO(t.outflow)}</span></div>
+        </div>
+
+        <div class="line savings total"><span class="lbl">Savings <span class="flow-formula">in − out</span></span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
       </div>`;
   }
   function emptyBoxHtml(type, mk) {
@@ -925,11 +972,11 @@ function renderTransactions() {
   // tagged with its type so the whole picture reads in a single glance.
   const perCardShare = state.cards.map(c => {
     const real = state.transactions.filter(t => t.period_id === period.id && t.card_id === c.id).reduce((s, t) => s + Number(t.wifey_share || 0), 0);
-    const virt = virtualEntriesForPeriod(period.id).filter(e => e.card_id === c.id).reduce((s, e) => s + e.wifey_share, 0);
+    const virt = virtualEntriesForPeriod(period.id).filter(e => e.card_id === c.id && e.toJustine).reduce((s, e) => s + e.wifey_share, 0);
     return { card: c, amount: real + virt };
   }).filter(x => x.amount !== 0);
   const otherOwed = [
-    ...glInstallments.filter(e => e.wifey_share !== 0).map(e => ({ description: e.description, amount: e.wifey_share })),
+    ...glInstallments.filter(e => e.wifey_share !== 0 && e.toJustine).map(e => ({ description: e.description, amount: e.wifey_share })),
     ...adjustments.filter(a => Number(a.amount) >= 0).map(a => ({ description: a.description, amount: Number(a.amount), id: a.id, editable: true })),
   ];
   const youCover = [
@@ -1054,9 +1101,10 @@ function renderTransactions() {
           ${virtualRows.map(e => {
             const jShare = e.amount - e.wifey_share;
             let splitHtml;
+            const who = escapeHtml(e.holder);
             if (e.wifey_share <= 0) splitHtml = '<span style="color:var(--text-dim);font-size:12px;">All Joven\'s</span>';
-            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Justine\'s</span>';
-            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Justine ${PESO(e.wifey_share)}</span></span>`;
+            else if (jShare <= 0) splitHtml = `<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All ${possessive(who)}</span>`;
+            else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ ${who} ${PESO(e.wifey_share)}</span></span>`;
             return `
             <tr style="background:rgba(227,177,88,.05);">
               <td>${escapeHtml(e.description)} <button class="synced-badge" data-edit-inst-sched="${e.installmentId}" style="border:none;cursor:pointer;" title="From the installment schedule - click to edit this period's split">⇄ payment plan, edit split</button></td>
@@ -1288,7 +1336,13 @@ function renderInstallmentsDashboard(list) {
 
   // Split with the other spouse - how much of these plans is actually theirs,
   // not yours, based on the same per-period split used in "View schedule".
-  const counterpartLabel = state.profile === 'joven' ? 'Justine' : 'Joven';
+  // On Joven's side a plan can be shared with Justine or anyone else, so name
+  // whoever is actually involved instead of assuming Justine.
+  const sharers = state.profile === 'joven'
+    ? [...new Set(list.filter(x => Number(x.wifey_monthly_share || 0) > 0 || Number(x.wifey_fee_share || 0) > 0).map(shareHolder))]
+    : ['Joven'];
+  const counterpartLabel = sharers.length ? sharers.join(', ') : 'Justine';
+  const theirs = sharers.length > 1 ? 'Their' : possessive(counterpartLabel);
   const counterpartMonthly = activeMetrics.reduce((s, x) => s + Number(x.i.wifey_monthly_share || 0), 0);
   const counterpartRemaining = metricsList.reduce((s, x) => {
     const cpRem = x.m.schedule.filter(r => !isRowPaid(r)).reduce((ss, r) => ss + totalWifeyShareForRow(x.i, r), 0);
@@ -1403,7 +1457,7 @@ function renderInstallmentsDashboard(list) {
     <details class="dash-more" id="dash-more" ${pref('dash_more_open', false) ? 'open' : ''}>
     <summary>More stats, split with ${counterpartLabel} &amp; bank rankings</summary>
     <div class="dash-stats">
-      <div class="stat-card"><div class="stat-label">Debt-to-income (net)</div><div class="stat-value">${dtiNet !== null ? dtiNet.toFixed(1) + '%' : '—'}</div><div class="stat-note">${dtiNet !== null ? `net of ${counterpartLabel}'s share` : 'add a period first'}</div></div>
+      <div class="stat-card"><div class="stat-label">Debt-to-income (net)</div><div class="stat-value">${dtiNet !== null ? dtiNet.toFixed(1) + '%' : '—'}</div><div class="stat-note">${dtiNet !== null ? `net of shared portions` : 'add a period first'}</div></div>
       <div class="stat-card"><div class="stat-label">Avg plan rate</div><div class="stat-value">${avgPlanRate.toFixed(1)}%</div><div class="stat-note">mean across plans</div></div>
       <div class="stat-card"><div class="stat-label">Cost of credit</div><div class="stat-value">${costOfCredit.toFixed(1)}%</div><div class="stat-note">₱-weighted overall</div></div>
       <div class="stat-card"><div class="stat-label">Paid off so far</div><div class="stat-value">${overallPaidPct.toFixed(1)}%</div><div class="stat-note">of lifetime total</div></div>
@@ -1413,10 +1467,10 @@ function renderInstallmentsDashboard(list) {
       <h4>Split with ${counterpartLabel} <span>how much of these plans is actually theirs, not yours</span></h4>
       <div class="dash-stats" style="margin-bottom:0;">
         <div class="stat-card"><div class="stat-label">Your net monthly</div><div class="stat-value">${PESO(yourNetMonthly)}</div><div class="stat-note">what you actually carry</div></div>
-        <div class="stat-card"><div class="stat-label">${counterpartLabel}'s monthly share</div><div class="stat-value">${PESO(counterpartMonthly)}</div><div class="stat-note">owed back to you each period</div></div>
+        <div class="stat-card"><div class="stat-label">${theirs} monthly share</div><div class="stat-value">${PESO(counterpartMonthly)}</div><div class="stat-note">owed back to you each period</div></div>
         <div class="stat-card"><div class="stat-label">Your net outstanding</div><div class="stat-value">${PESO(yourNetOutstanding)}</div></div>
-        <div class="stat-card"><div class="stat-label">${counterpartLabel} owes (remaining)</div><div class="stat-value">${PESO(counterpartRemaining)}</div></div>
-        <div class="stat-card"><div class="stat-label">${counterpartLabel}'s lifetime share</div><div class="stat-value">${PESO(counterpartLifetime)}</div><div class="stat-note">across all these plans, paid + unpaid</div></div>
+        <div class="stat-card"><div class="stat-label">${sharers.length > 1 ? 'They owe' : counterpartLabel + ' owes'} (remaining)</div><div class="stat-value">${PESO(counterpartRemaining)}</div></div>
+        <div class="stat-card"><div class="stat-label">${theirs} lifetime share</div><div class="stat-value">${PESO(counterpartLifetime)}</div><div class="stat-note">across all these plans, paid + unpaid</div></div>
       </div>
     </div>
 
@@ -1510,7 +1564,7 @@ function renderInstallments() {
     if (i.archived) el.style.opacity = '.6';
     el.innerHTML = `
       <div class="name">${escapeHtml(i.name)}</div>
-      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo</div>
+      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo${i.owner === 'joven' && Number(i.wifey_monthly_share) > 0 ? ` • <span style="color:var(--purple);">${escapeHtml(shareHolder(i))} pays ${PESO(i.wifey_monthly_share)}</span>` : ''}</div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%;background:${done ? 'var(--green)' : 'var(--gold)'}"></div></div>
       <div class="foot">
         <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}${overdueCount ? ` <b style="color:var(--red);">· ${overdueCount} overdue</b>` : ''}</span>
@@ -1563,7 +1617,7 @@ async function regenerateSchedule(inst) {
 function openScheduleModal(inst) {
   const schedule = scheduleForInstallment(inst.id);
   const nextId = nextDueRowId(schedule);
-  const counterpartLabel = inst.owner === 'joven' ? "Justine's share" : "Joven's share";
+  const counterpartLabel = inst.owner === 'joven' ? `${possessive(escapeHtml(shareHolder(inst)))} share` : "Joven's share";
   // The Paid column only appears once migration_schedule_paid.sql has been run.
   const hasPaidCol = state.installmentSchedule.some(r => 'paid' in r);
   const inputStyle = 'width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;';
@@ -1640,7 +1694,12 @@ function openInstallModal(item) {
     card_id: state.cards[0]?.id || '', name: '', principal: '', fee: 0, monthly_amount: '', start_date: '',
     num_months: 12, payer: '', wifey_monthly_share: 0, wifey_fee_share: 0,
   };
-  const counterpartLabel = state.profile === 'joven' ? "Justine's" : "Joven's";
+  // "Shared with" only exists on Joven's side, and only once
+  // migration_installment_share_with.sql has been run.
+  const hasShareWithCol = state.profile === 'joven' && state.installments.some(x => 'share_with' in x);
+  const holderNow = state.profile === 'joven' ? shareHolder(i) : 'Joven';
+  const knownSharers = [...new Set(['Justine', ...state.installments.filter(x => x.owner === 'joven').map(shareHolder)])];
+  const counterpartLabel = escapeHtml(possessive(holderNow));
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} installment</h3>
     <div class="field-row">
@@ -1655,12 +1714,21 @@ function openInstallModal(item) {
     <div class="field-row">
       <div class="field"><label>Principal</label><input type="number" step="0.01" id="f-principal" value="${i.principal}"></div>
       <div class="field"><label>Fee</label><input type="number" step="0.01" id="f-fee" value="${i.fee}"></div>
-      <div class="field"><label>${counterpartLabel} share of the fee</label><input type="number" step="0.01" id="f-feeshare" value="${i.wifey_fee_share}"></div>
     </div>
+    ${hasShareWithCol ? `
+    <div class="field-row">
+      <div class="field"><label>Shared with</label>
+        <input type="text" id="f-sharewith" list="sharer-list" value="${escapeHtml(holderNow)}" placeholder="Justine">
+        <datalist id="sharer-list">${knownSharers.map(n => `<option value="${escapeHtml(n)}">`).join('')}</datalist>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">Justine's share goes into her total (paid on the 30th). Anyone else's share shows up automatically as money in on the period it's due.</p>` : ''}
+    <div class="field-row">
+      <div class="field"><label><span data-sharer-label>${counterpartLabel}</span> share of the fee</label><input type="number" step="0.01" id="f-feeshare" value="${i.wifey_fee_share}"></div>
     <div class="field-row">
       <div class="field"><label>Monthly amount</label><input type="number" step="0.01" id="f-monthly" value="${i.monthly_amount}"></div>
       <div class="field"><label># of months</label><input type="number" id="f-months" value="${i.num_months}"></div>
-      <div class="field"><label>${counterpartLabel} share (per month)</label><input type="number" step="0.01" id="f-monthlyshare" value="${i.wifey_monthly_share}"></div>
+      <div class="field"><label><span data-sharer-label>${counterpartLabel}</span> share (per month)</label><input type="number" step="0.01" id="f-monthlyshare" value="${i.wifey_monthly_share}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Start date</label><input type="date" id="f-start" value="${i.start_date}"></div>
@@ -1672,6 +1740,12 @@ function openInstallModal(item) {
       <button class="btn" id="modal-save">Save</button>
     </div>
   `);
+  if (hasShareWithCol) {
+    $('#f-sharewith').oninput = () => {
+      const name = $('#f-sharewith').value.trim() || 'Justine';
+      $$('[data-sharer-label]').forEach(el => el.textContent = possessive(name));
+    };
+  }
   $('#modal-save').onclick = async () => {
     const payload = {
       card_id: $('#f-card').value || null,
@@ -1685,6 +1759,10 @@ function openInstallModal(item) {
       start_date: $('#f-start').value,
       payer: $('#f-payer').value.trim(),
     };
+    if (hasShareWithCol) {
+      const who = $('#f-sharewith').value.trim();
+      payload.share_with = !who || who.toLowerCase() === 'justine' ? null : who; // blank = Justine
+    }
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
     let error, savedId = i.id;
     const scheduleAffectingFieldsChanged = isEdit && (
@@ -1706,6 +1784,13 @@ function openInstallModal(item) {
     // edits in "View schedule" untouched.
     if (savedId && (!isEdit || scheduleAffectingFieldsChanged)) {
       await regenerateSchedule({ ...payload, id: savedId });
+    } else if (isEdit && Number(payload.wifey_monthly_share) !== Number(i.wifey_monthly_share || 0)) {
+      // New per-month share: apply it to every schedule row still on the old
+      // default. Rows you edited by hand in "View schedule" are left alone.
+      dbOk(await db.from('installment_schedule')
+        .update({ wifey_share: payload.wifey_monthly_share })
+        .eq('installment_id', i.id)
+        .eq('wifey_share', Number(i.wifey_monthly_share || 0)));
     }
     closeModal(); await loadAll(); renderView();
   };
@@ -2297,6 +2382,70 @@ function showModal(html) {
 function closeModal() { $('#modal-backdrop').classList.remove('active'); }
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+/* ---------------- SUM OF SELECTED AMOUNTS (like Sheets) ----------------
+   Drag-select across numbers, or click amounts one by one to pick them, and
+   a bar at the bottom shows their sum, average and count. Esc or ✕ clears. */
+
+const PESO_RE = /([+-]?)₱\s?(-?)([\d,]+(?:\.\d+)?)/g;
+function pesoValues(text) {
+  const vals = [];
+  for (const m of text.matchAll(PESO_RE)) {
+    const n = Number(m[3].replace(/,/g, ''));
+    if (!isNaN(n)) vals.push(m[1] === '-' || m[2] === '-' ? -n : n);
+  }
+  return vals;
+}
+const SUMMABLE = '.val, td.num, .stat-value, .sh .total, .snapshot-val, .payoff-chip-amt, .payoff-freed';
+
+function updateSumBar() {
+  const bar = $('#sum-bar');
+  if (!bar) return;
+  let vals = [];
+  const picked = $$('.sum-picked');
+  if (picked.length) {
+    picked.forEach(el => { const v = pesoValues(el.textContent); if (v.length) vals.push(v[0]); });
+  } else {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && !(document.activeElement && /INPUT|TEXTAREA/.test(document.activeElement.tagName))) {
+      vals = pesoValues(sel.toString());
+    }
+  }
+  if (!vals.length) { bar.classList.remove('active'); return; }
+  const sum = vals.reduce((a, b) => a + b, 0);
+  bar.innerHTML = `
+    <span>Sum <b>${PESO(sum)}</b></span>
+    ${vals.length > 1 ? `<span>Average <b>${PESO(sum / vals.length)}</b></span>` : ''}
+    <span>Count <b>${vals.length}</b></span>
+    <button type="button" id="sum-bar-clear" title="Clear (Esc)" aria-label="Clear">✕</button>`;
+  $('#sum-bar-clear').onclick = clearSumSelection;
+  bar.classList.add('active');
+}
+function clearSumSelection() {
+  $$('.sum-picked').forEach(el => el.classList.remove('sum-picked'));
+  const sel = window.getSelection();
+  if (sel) sel.removeAllRanges();
+  updateSumBar();
+}
+function initSumBar() {
+  const bar = document.createElement('div');
+  bar.id = 'sum-bar';
+  bar.setAttribute('role', 'status');
+  document.body.appendChild(bar);
+  let t = null;
+  document.addEventListener('selectionchange', () => { clearTimeout(t); t = setTimeout(updateSumBar, 80); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && bar.classList.contains('active') && !$('#modal-backdrop').classList.contains('active')) clearSumSelection(); });
+  document.addEventListener('click', e => {
+    if (e.target.closest('button, a, input, select, textarea, label, .modal')) return;
+    const el = e.target.closest(SUMMABLE);
+    if (!el || !el.closest('#main') || !pesoValues(el.textContent).length) return;
+    if (window.getSelection().toString()) return; // that was a drag-select, not a click
+    el.classList.toggle('sum-picked');
+    updateSumBar();
+  });
+  // Any re-render replaces the numbers, so picked ones disappear - refresh the bar.
+  new MutationObserver(() => updateSumBar()).observe($('#main'), { childList: true });
+}
+
 /* ---------------- INIT ---------------- */
 /* ---------- Mobile drawer ---------- */
 function closeMobileSidebar() {
@@ -2315,4 +2464,5 @@ document.addEventListener('DOMContentLoaded', () => {
   if (backdrop) backdrop.onclick = closeMobileSidebar;
 });
 
+document.addEventListener('DOMContentLoaded', initSumBar);
 document.addEventListener('DOMContentLoaded', initAuth);
