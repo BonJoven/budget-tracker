@@ -69,6 +69,7 @@ create table installments (
   owner text not null default 'joven',       -- 'joven' or 'justine' - whose tracker this belongs to
   wifey_monthly_share numeric not null default 0,  -- portion of EACH monthly payment that's the other spouse's
   wifey_fee_share numeric not null default 0,      -- portion of the fee (1st payment only) that's the other spouse's
+  share_with text,               -- who the shared part belongs to on Joven's plans (blank = Justine)
   billed_to_card_id uuid references credit_cards(id),  -- unused (kept for backward compatibility)
   notes text,
   archived boolean not null default false
