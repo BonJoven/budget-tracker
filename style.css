@@ -703,3 +703,52 @@ tr:hover td{background:var(--surface2);}
   .pg-mini{width:100%;}
   .toast{left:16px;right:16px;bottom:16px;}
 }
+
+/* ============================================================
+   Period card: Money in / Money out sections
+   ============================================================ */
+.flow{
+  margin:4px 0 12px;padding:4px 0 2px 12px;
+  border-left:3px solid var(--border);
+}
+.flow-in{border-left-color:var(--green);}
+.flow-out{border-left-color:var(--red);}
+.flow-head{
+  font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;
+  padding:4px 0 2px;
+}
+.flow-in .flow-head{color:var(--green);}
+.flow-out .flow-head{color:var(--red);}
+.line.flow-total{border-bottom:none;padding-top:8px;font-weight:700;}
+.line.flow-total .lbl{color:var(--text);}
+.flow-in .flow-total .val{color:var(--green);}
+.flow-out .flow-total .val{color:var(--red);}
+.flow-formula{font-size:11px;font-weight:400;color:var(--text-dim);margin-left:6px;}
+.period-card .line.savings.total{border-top:1px solid var(--border);margin-top:2px;}
+
+/* ============================================================
+   Sum of selected amounts (like Sheets)
+   ============================================================ */
+.sum-picked{
+  background:rgba(227,177,88,.22) !important;
+  outline:1px solid var(--gold);border-radius:4px;
+}
+.val, td.num, .stat-value, .sh .total, .snapshot-val, .payoff-chip-amt, .payoff-freed{cursor:cell;}
+#sum-bar{
+  position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:90;
+  display:none;align-items:center;gap:18px;
+  background:var(--surface2);border:1px solid var(--gold);border-radius:99px;
+  padding:9px 10px 9px 20px;font-size:13px;color:var(--text-dim);
+  box-shadow:0 8px 24px rgba(0,0,0,.4);white-space:nowrap;
+}
+#sum-bar.active{display:flex;}
+#sum-bar b{color:var(--text);font-variant-numeric:tabular-nums;margin-left:4px;}
+#sum-bar span:first-child b{color:var(--gold);}
+#sum-bar button{
+  background:transparent;border:1px solid var(--border);color:var(--text-dim);
+  width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:11px;
+}
+#sum-bar button:hover{color:var(--text);border-color:var(--text-dim);}
+@media (max-width: 768px) {
+  #sum-bar{left:16px;right:16px;transform:none;justify-content:space-between;gap:10px;font-size:12px;padding-left:14px;}
+}
