@@ -277,7 +277,7 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments, visionBoards, visionBoardChecklist, visionBoardImages, installmentItems] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments, visionBoards, visionBoardChecklist, visionBoardImages, installmentItems, justineIncome] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: true }),
     db.from('transactions').select('*'),
@@ -291,6 +291,7 @@ async function loadAll() {
     db.from('vision_board_checklist').select('*').order('sort_order'),
     db.from('vision_board_images').select('*').order('sort_order'),
     db.from('installment_items').select('*').order('sort_order'),
+    db.from('justine_income_items').select('*'),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
@@ -307,6 +308,9 @@ async function loadAll() {
   // The breakdown feature switches itself on once migration_installment_items.sql has been run.
   state.itemsTableOk = !installmentItems.error;
   state.installmentItems = installmentItems.data || [];
+  // Justine's income lines switch on once migration_justine_income.sql has been run.
+  state.justineIncomeOk = !justineIncome.error;
+  state.justineIncomeItems = justineIncome.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
@@ -420,14 +424,20 @@ function totalWifeyShareForRow(inst, row) {
   return Number(row.wifey_share || 0) + (row.is_fee_row ? Number(inst.wifey_fee_share || 0) : 0);
 }
 
-// Who pays back the shared part of one of Joven's installments ("Shared with"
-// on the installment). Blank = Justine - every plan made before this field
-// existed was shared with her.
+// Who pays back the shared part of an installment ("Shared with"). Blank means
+// the other spouse - every plan made before this field existed was shared
+// between the two of them: Justine on Joven's plans, Joven on Justine's.
+const defaultSharerFor = owner => owner === 'justine' ? 'Joven' : 'Justine';
 function shareHolder(inst) {
-  return (inst.share_with || '').trim() || 'Justine';
+  return (inst.share_with || '').trim() || defaultSharerFor(inst.owner);
 }
+// Joven's plan, shared with Justine -> goes into her total.
 function isJustineShare(inst) {
-  return shareHolder(inst).toLowerCase() === 'justine';
+  return inst.owner !== 'justine' && shareHolder(inst).toLowerCase() === 'justine';
+}
+// Justine's plan, part covered by Joven -> reduces what she owes him.
+function isJovenShare(inst) {
+  return inst.owner === 'justine' && shareHolder(inst).toLowerCase() === 'joven';
 }
 const possessive = name => name + (/s$/i.test(name) ? "'" : "'s");
 
@@ -464,7 +474,7 @@ function virtualEntriesForPeriod(periodId) {
 // the one paying that amount (it reduces what she owes him overall).
 function justineSharedLedgerEntriesForPeriod(periodId) {
   const entries = [];
-  state.installments.filter(i => !i.archived && i.owner === 'justine').forEach(inst => {
+  state.installments.filter(i => !i.archived && isJovenShare(i)).forEach(inst => {
     scheduleForInstallment(inst.id).forEach(row => {
       const share = totalWifeyShareForRow(inst, row);
       if (periodIdForDate(row.due_date) === periodId && share > 0) {
@@ -1358,10 +1368,8 @@ function renderInstallmentsDashboard(list) {
   // not yours, based on the same per-period split used in "View schedule".
   // On Joven's side a plan can be shared with Justine or anyone else, so name
   // whoever is actually involved instead of assuming Justine.
-  const sharers = state.profile === 'joven'
-    ? [...new Set(list.filter(x => Number(x.wifey_monthly_share || 0) > 0 || Number(x.wifey_fee_share || 0) > 0).map(shareHolder))]
-    : ['Joven'];
-  const counterpartLabel = sharers.length ? sharers.join(', ') : 'Justine';
+  const sharers = [...new Set(list.filter(x => Number(x.wifey_monthly_share || 0) > 0 || Number(x.wifey_fee_share || 0) > 0).map(shareHolder))];
+  const counterpartLabel = sharers.length ? sharers.join(', ') : defaultSharerFor(state.profile);
   const theirs = sharers.length > 1 ? 'Their' : possessive(counterpartLabel);
   const counterpartMonthly = activeMetrics.reduce((s, x) => s + Number(x.i.wifey_monthly_share || 0), 0);
   const counterpartRemaining = metricsList.reduce((s, x) => {
@@ -1584,7 +1592,7 @@ function renderInstallments() {
     if (i.archived) el.style.opacity = '.6';
     el.innerHTML = `
       <div class="name">${escapeHtml(i.name)}</div>
-      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo${i.owner === 'joven' && Number(i.wifey_monthly_share) > 0 ? ` • <span style="color:var(--purple);">${escapeHtml(shareHolder(i))} pays ${PESO(i.wifey_monthly_share)}</span>` : ''}</div>
+      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo${Number(i.wifey_monthly_share) > 0 ? ` • <span style="color:var(--purple);">${escapeHtml(shareHolder(i))} pays ${PESO(i.wifey_monthly_share)}</span>` : ''}</div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%;background:${done ? 'var(--green)' : 'var(--gold)'}"></div></div>
       <div class="foot">
         <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}${overdueCount ? ` <b style="color:var(--red);">· ${overdueCount} overdue</b>` : ''}</span>
@@ -1641,7 +1649,7 @@ async function regenerateSchedule(inst) {
 function openScheduleModal(inst) {
   const schedule = scheduleForInstallment(inst.id);
   const nextId = nextDueRowId(schedule);
-  const counterpartLabel = inst.owner === 'joven' ? `${possessive(escapeHtml(shareHolder(inst)))} share` : "Joven's share";
+  const counterpartLabel = `${possessive(escapeHtml(shareHolder(inst)))} share`;
   // The Paid column only appears once migration_schedule_paid.sql has been run.
   const hasPaidCol = state.installmentSchedule.some(r => 'paid' in r);
   const inputStyle = 'width:100px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;text-align:right;';
@@ -1721,7 +1729,7 @@ function breakdownText(inst) {
   const items = itemsForInstallment(inst.id);
   const card = state.cards.find(c => c.id === inst.card_id);
   const schedule = scheduleForInstallment(inst.id);
-  const sharer = inst.owner === 'joven' ? shareHolder(inst) : 'Joven';
+  const sharer = shareHolder(inst);
   const total = items.reduce((s, x) => s + Number(x.amount), 0);
   const monthLabel = d => new Date(d + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' });
   const lines = [
@@ -1746,7 +1754,7 @@ function breakdownText(inst) {
 
 function openBreakdownModal(inst) {
   const items = itemsForInstallment(inst.id);
-  const sharer = inst.owner === 'joven' ? shareHolder(inst) : 'Joven';
+  const sharer = shareHolder(inst);
   const total = items.reduce((s, x) => s + Number(x.amount), 0);
   const text = breakdownText(inst);
   showModal(`
@@ -1787,9 +1795,10 @@ function openInstallModal(item) {
   };
   // "Shared with" only exists on Joven's side, and only once
   // migration_installment_share_with.sql has been run.
-  const hasShareWithCol = state.profile === 'joven' && state.installments.some(x => 'share_with' in x);
-  const holderNow = state.profile === 'joven' ? shareHolder(i) : 'Joven';
-  const knownSharers = [...new Set(['Justine', ...state.installments.filter(x => x.owner === 'joven').map(shareHolder)])];
+  const hasShareWithCol = state.installments.some(x => 'share_with' in x);
+  const defaultSharer = defaultSharerFor(state.profile);
+  const holderNow = shareHolder({ ...i, owner: i.owner || state.profile });
+  const knownSharers = [...new Set([defaultSharer, ...state.installments.filter(x => x.owner === state.profile).map(shareHolder)])];
   const counterpartLabel = escapeHtml(possessive(holderNow));
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} installment</h3>
@@ -1809,11 +1818,13 @@ function openInstallModal(item) {
     ${hasShareWithCol ? `
     <div class="field-row">
       <div class="field"><label>Shared with</label>
-        <input type="text" id="f-sharewith" list="sharer-list" value="${escapeHtml(holderNow)}" placeholder="Justine">
+        <input type="text" id="f-sharewith" list="sharer-list" value="${escapeHtml(holderNow)}" placeholder="${defaultSharer}">
         <datalist id="sharer-list">${knownSharers.map(n => `<option value="${escapeHtml(n)}">`).join('')}</datalist>
       </div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">Justine's share goes into her total (paid on the 30th). Anyone else's share shows up automatically as money in on the period it's due.</p>` : ''}
+    <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">${state.profile === 'joven'
+      ? "Justine's share goes into her total (paid on the 30th). Anyone else's share shows up automatically as money in on the period it's due."
+      : "Joven's share is what he covers - it comes off her Joven CC Total. Anyone else's share shows up automatically as money in on the month it's due."}</p>` : ''}
     <div class="field-row">
       <div class="field"><label><span data-sharer-label>${counterpartLabel}</span> share of the fee</label><input type="number" step="0.01" id="f-feeshare" value="${i.wifey_fee_share}"></div>
     </div>
@@ -1844,7 +1855,7 @@ function openInstallModal(item) {
   // ---- Breakdown: items, each with an owner. The shared person's slice of
   // the item total sets their monthly + fee share automatically. ----
   const selfName = state.profile === 'joven' ? 'Joven' : 'Justine';
-  const currentSharer = () => hasShareWithCol ? ($('#f-sharewith').value.trim() || 'Justine') : holderNow;
+  const currentSharer = () => hasShareWithCol ? ($('#f-sharewith').value.trim() || defaultSharer) : holderNow;
   let items = state.itemsTableOk && isEdit ? itemsForInstallment(i.id).map(x => ({ label: x.label, owner: x.owner, amount: x.amount })) : [];
   const renderItemRows = () => {
     if (!state.itemsTableOk) return;
@@ -1914,7 +1925,7 @@ function openInstallModal(item) {
 
   if (hasShareWithCol) {
     $('#f-sharewith').oninput = () => {
-      const name = $('#f-sharewith').value.trim() || 'Justine';
+      const name = $('#f-sharewith').value.trim() || defaultSharer;
       $$('[data-sharer-label]').forEach(el => el.textContent = possessive(name));
       renderItemRows();
       updateItemsSummary(true);
@@ -1935,7 +1946,7 @@ function openInstallModal(item) {
     };
     if (hasShareWithCol) {
       const who = $('#f-sharewith').value.trim();
-      payload.share_with = !who || who.toLowerCase() === 'justine' ? null : who; // blank = Justine
+      payload.share_with = !who || who.toLowerCase() === defaultSharer.toLowerCase() ? null : who; // blank = the other spouse
     }
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
     let error, savedId = i.id;
@@ -2058,7 +2069,7 @@ function fixedForSlot(mk, type) {
           if (isJustineShare(inst)) r.justine += share;
           else { const who = shareHolder(inst); r.others.set(who, (r.others.get(who) || 0) + share); }
         }
-      } else if (share > 0) {
+      } else if (share > 0 && isJovenShare(inst)) {
         r.justine -= share; // one of her plans that you cover - reduces what she owes
       }
     });
@@ -2250,6 +2261,8 @@ function computeJustineForecast(a) {
     const inLines = [], outLines = [];
     const recPay = m ? Number(m.paycheck_budget) || 0 : 0;
     inLines.push({ label: recPay ? 'Paycheck budget' : 'Paycheck budget (assumed)', amount: recPay || Number(a.pay) || 0 });
+    justineOtherShareIncomeForMonth(mk).forEach(o => inLines.push({ label: o.person, amount: o.amount, tag: 'installment share' }));
+    if (m) { const inc = justineIncomeForMonth(m.id).reduce((s2, x) => s2 + Number(x.amount), 0); if (inc) inLines.push({ label: 'Income lines', amount: inc }); }
     // What she owes Joven this month - from his tracker where it exists, else from shared installments.
     const jovenCc = justineOwnForSlot(mk, '15th') + justineOwnForSlot(mk, '30th');
     if (jovenCc) outLines.push({ label: 'Joven CC total', amount: jovenCc, tag: 'from his tracker' });
@@ -2899,19 +2912,51 @@ function justineBillsForMonth(monthId) {
   return state.justineBills.filter(b => b.month_id === monthId);
 }
 
+function justineIncomeForMonth(monthId) {
+  return (state.justineIncomeItems || []).filter(i => i.month_id === monthId);
+}
+// Shares owed to Justine by anyone other than Joven on her installments
+// (Joven's share is handled through the Joven CC Total instead).
+function justineOtherShareIncomeForMonth(mk) {
+  const byPerson = new Map();
+  state.installments.filter(i => !i.archived && i.owner === 'justine' && !isJovenShare(i)).forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      if (monthKey(row.due_date) !== mk) return;
+      const share = totalWifeyShareForRow(inst, row);
+      if (share <= 0) return;
+      const who = shareHolder(inst), key = who.toLowerCase();
+      if (!byPerson.has(key)) byPerson.set(key, { person: who, amount: 0, plans: [] });
+      const g = byPerson.get(key);
+      g.amount += share;
+      g.plans.push(`${inst.name}: ${PESO(share)}`);
+    });
+  });
+  return [...byPerson.values()].sort((a, b) => a.person.localeCompare(b.person));
+}
+function previousJustineMonthOf(dateStr, excludeId) {
+  if (!dateStr) return null;
+  return state.justineMonths
+    .filter(m => !m.archived && m.id !== excludeId && m.month_date < dateStr)
+    .sort((a, b) => b.month_date.localeCompare(a.month_date))[0] || null;
+}
+
 function justineTotals(m) {
   const jovenCc = jovenJustineTotalForMonth(m.month_date);
   const billsTotal = justineBillsForMonth(m.id).reduce((s, b) => s + Number(b.amount), 0);
   const generalLedger = justineGeneralLedgerTotalForMonth(m.month_date);
   const payablesTotal = Number(m.bpi_total) + Number(m.eastwest_total) + billsTotal + generalLedger;
   const totalOutflow = jovenCc.total + payablesTotal;
-  const savings = Number(m.paycheck_budget) - totalOutflow;
-  return { billsTotal, payablesTotal, totalOutflow, savings, jovenCc, generalLedger };
+  const extraIncome = justineIncomeForMonth(m.id).reduce((s, i) => s + Number(i.amount), 0);
+  const otherShares = justineOtherShareIncomeForMonth(monthKey(m.month_date));
+  const otherShareIncome = otherShares.reduce((s, o) => s + o.amount, 0);
+  const income = Number(m.paycheck_budget) + Number(m.previous_savings || 0) + extraIncome + otherShareIncome;
+  const savings = income - totalOutflow;
+  return { billsTotal, payablesTotal, totalOutflow, savings, jovenCc, generalLedger, income, extraIncome, otherShares, otherShareIncome };
 }
 
 function renderJustineSummary() {
   const main = $('#main');
-  const months = state.justineMonths.filter(m => !m.archived);
+  const months = state.justineMonths.filter(m => !m.archived).sort((a, b) => b.month_date.localeCompare(a.month_date)); // newest first
   const archivedMonths = state.justineMonths.filter(m => m.archived);
   main.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -2932,41 +2977,95 @@ function renderJustineSummary() {
     grid.innerHTML = `<div class="empty-state">No months yet. Click "New month" to add August.</div>`;
     return;
   }
-  months.forEach(m => {
+  // Same as Joven's Summary: the newest few months in full, older ones folded
+  // to a one-line total you can click open.
+  const RECENT_MONTHS_SHOWN = 3;
+  months.forEach((m, idx) => {
     const t = justineTotals(m);
     const monthLabel = new Date(m.month_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
+    const foldKey = 'j:' + monthKey(m.month_date);
+    const collapsible = idx >= RECENT_MONTHS_SHOWN;
+    if (collapsible && !state.expandedMonths.has(foldKey)) {
+      const el = document.createElement('div');
+      el.className = 'period-group-card collapsed';
+      el.style.gridColumn = '1 / -1';
+      el.innerHTML = `
+        <button class="pg-toggle" data-toggle-month="${foldKey}" title="Show this month">
+          <span class="pg-header">▸ ${monthLabel}</span>
+          <span class="pg-mini">Outflow <b>${PESO(t.totalOutflow)}</b><span class="pg-sep">·</span>Ended with <b style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</b></span>
+        </button>`;
+      grid.appendChild(el);
+      return;
+    }
     const el = document.createElement('div');
     el.className = 'period-card';
     el.innerHTML = `
       <div class="ph">
-        <div><span class="tag">${monthLabel}</span></div>
+        <div>${collapsible ? `<button class="pg-toggle" data-toggle-month="${foldKey}" title="Collapse this month" style="width:auto;"><span class="tag">▾ ${monthLabel}</span></button>` : `<span class="tag">${monthLabel}</span>`}</div>
         <div>
           <button class="icon-btn edit" data-edit-m="${m.id}" title="Edit" aria-label="Edit">✎</button>
           <button class="icon-btn" data-archive-m="${m.id}" title="Archive" aria-label="Archive">📦</button>
         </div>
       </div>
-      <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
-      <div class="line"><span class="lbl">Joven CC Total <span class="synced-badge" title="Sum of Joven's Justine line on his 15th + 30th periods this month">⇄ synced</span></span><span class="val">${(t.jovenCc.hasP15 || t.jovenCc.hasP30) ? PESO(t.jovenCc.total) : '<span style="color:var(--text-dim)">no periods yet</span>'}</span></div>
-      <div class="line"><span class="lbl">BPI</span><span class="val">${PESO(m.bpi_total)}</span></div>
-      <div class="line"><span class="lbl">Eastwest</span><span class="val">${PESO(m.eastwest_total)}</span></div>
-      <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(t.generalLedger)}</span></div>
-      ${justineBillsForMonth(m.id).map(b => `
-        <div class="line">
-          <span class="lbl">${escapeHtml(b.label)}
-            <button class="icon-btn edit" data-edit-bill="${b.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
-            <button class="icon-btn" data-del-bill="${b.id}" title="Delete" aria-label="Delete">✕</button>
-          </span>
-          <span class="val">${PESO(b.amount)}</span>
-        </div>`).join('')}
-      <div class="line"><span class="lbl"><button class="icon-btn" data-add-bill="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ bill</button></span><span class="val"></span></div>
-      <div class="line outflow total"><span class="lbl">Total outflow</span><span class="val">${PESO(t.totalOutflow)}</span></div>
-      <div class="line savings total"><span class="lbl">Savings</span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
+
+      <div class="flow flow-in">
+        <div class="flow-head">↓ Money in</div>
+        <div class="line"><span class="lbl">💰 Paycheck budget</span><span class="val">${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
+        <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(m.previous_savings || 0)}</span></div>
+        ${t.otherShares.map(o => `
+          <div class="line"><span class="lbl">${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span></span><span class="val">${PESO(o.amount)}</span></div>`).join('')}
+        ${justineIncomeForMonth(m.id).map(item => `
+          <div class="line">
+            <span class="lbl">${escapeHtml(item.label)}
+              <button class="icon-btn edit" data-edit-jincome="${item.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
+              <button class="icon-btn" data-del-jincome="${item.id}" title="Delete" aria-label="Delete">✕</button>
+            </span>
+            <span class="val">${PESO(item.amount)}</span>
+          </div>`).join('')}
+        ${state.justineIncomeOk ? `<div class="line"><span class="lbl"><button class="icon-btn" data-add-jincome="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>` : ''}
+        <div class="line flow-total"><span class="lbl">Total in</span><span class="val">${PESO(t.income)}</span></div>
+      </div>
+
+      <div class="flow flow-out">
+        <div class="flow-head">↑ Money out</div>
+        <div class="line"><span class="lbl">Joven CC Total <span class="synced-badge" title="Sum of Joven's Justine line on his 15th + 30th periods this month">⇄ synced</span></span><span class="val">${(t.jovenCc.hasP15 || t.jovenCc.hasP30) ? PESO(t.jovenCc.total) : '<span style="color:var(--text-dim)">no periods yet</span>'}</span></div>
+        <div class="line"><span class="lbl card-chip"><span class="sw" style="background:${(state.cards.find(c => c.name.toLowerCase() === 'bpi') || {}).color || 'var(--red)'}"></span>BPI</span><span class="val">${PESO(m.bpi_total)}</span></div>
+        <div class="line"><span class="lbl card-chip"><span class="sw" style="background:${(state.cards.find(c => c.name.toLowerCase() === 'eastwest') || {}).color || 'var(--purple)'}"></span>Eastwest</span><span class="val">${PESO(m.eastwest_total)}</span></div>
+        <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(t.generalLedger)}</span></div>
+        ${justineBillsForMonth(m.id).map(b => `
+          <div class="line">
+            <span class="lbl">${escapeHtml(b.label)}
+              <button class="icon-btn edit" data-edit-bill="${b.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
+              <button class="icon-btn" data-del-bill="${b.id}" title="Delete" aria-label="Delete">✕</button>
+            </span>
+            <span class="val">${PESO(b.amount)}</span>
+          </div>`).join('')}
+        <div class="line"><span class="lbl"><button class="icon-btn" data-add-bill="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ bill</button></span><span class="val"></span></div>
+        <div class="line flow-total"><span class="lbl">Total out</span><span class="val">${PESO(t.totalOutflow)}</span></div>
+      </div>
+
+      <div class="line savings total"><span class="lbl">Savings <span class="flow-formula">in − out</span></span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
       <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">
         <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;">Notes</label>
         <textarea data-notes-for="${m.id}" placeholder="Jot anything down here…" style="width:100%;min-height:60px;margin-top:6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-family:inherit;font-size:13px;resize:vertical;">${m.notes ? escapeHtml(m.notes) : ''}</textarea>
       </div>
     `;
     grid.appendChild(el);
+  });
+  $$('[data-toggle-month]').forEach(btn => btn.onclick = () => {
+    const k = btn.dataset.toggleMonth;
+    if (state.expandedMonths.has(k)) state.expandedMonths.delete(k); else state.expandedMonths.add(k);
+    renderJustineSummary();
+  });
+  $$('[data-add-jincome]').forEach(btn => btn.onclick = () => openJustineIncomeModal(null, btn.dataset.addJincome));
+  $$('[data-edit-jincome]').forEach(btn => btn.onclick = () => {
+    const item = state.justineIncomeItems.find(x => x.id === btn.dataset.editJincome);
+    openJustineIncomeModal(item, item.month_id);
+  });
+  $$('[data-del-jincome]').forEach(btn => btn.onclick = async () => {
+    if (!confirm('Delete this income line?')) return;
+    if (!dbOk(await db.from('justine_income_items').delete().eq('id', btn.dataset.delJincome))) return;
+    await loadAll(); renderView();
   });
   $$('[data-notes-for]').forEach(t => {
     t.onblur = async () => {
@@ -3012,7 +3111,12 @@ function renderJustineSummary() {
 
 function openJustineMonthModal(month) {
   const isEdit = !!month;
-  const m = month || { month_date: '', paycheck_budget: 0, bpi_total: 0, eastwest_total: 0 };
+  const m = month || { month_date: '', paycheck_budget: 0, previous_savings: 0, bpi_total: 0, eastwest_total: 0 };
+  if (!isEdit) {
+    // Brand-new month: start from what the month before it ended with.
+    const before = state.justineMonths.filter(x => !x.archived).sort((x, y) => y.month_date.localeCompare(x.month_date))[0];
+    if (before) m.previous_savings = round2(justineTotals(before).savings);
+  }
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} month</h3>
     <div class="field-row">
@@ -3020,29 +3124,73 @@ function openJustineMonthModal(month) {
     </div>
     <div class="field-row">
       <div class="field"><label>💰 Paycheck Budget</label><input type="number" step="0.01" id="f-budget" value="${m.paycheck_budget}"></div>
+      <div class="field"><label>Previous savings</label><input type="number" step="0.01" id="f-prev" value="${m.previous_savings || 0}"></div>
     </div>
+    <div id="carry-wrap"></div>
     <div class="field-row">
       <div class="field"><label>BPI</label><input type="number" step="0.01" id="f-bpi" value="${m.bpi_total}"></div>
       <div class="field"><label>Eastwest</label><input type="number" step="0.01" id="f-ew" value="${m.eastwest_total}"></div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);">Joven CC Total isn't entered here — it's automatically the sum of Joven's "Justine" line on his 15th + 30th periods for this same month. Savings = 💰 minus everything below.</p>
+    <p style="font-size:12px;color:var(--text-dim);">Joven CC Total isn't entered here — it's automatically the sum of Joven's "Justine" line on his 15th + 30th periods for this same month. Savings = money in (💰, previous savings, income lines, shares owed to her) minus money out.</p>
     <div class="modal-actions">
       <button class="btn secondary" id="modal-cancel">Cancel</button>
       <button class="btn" id="modal-save">Save</button>
     </div>
   `);
+  // Offers the previous month's ending savings whenever the field doesn't match it.
+  const updateCarry = () => {
+    const mv = $('#f-month').value;
+    const before = mv ? previousJustineMonthOf(mv + '-01', m.id) : null;
+    const wrap = $('#carry-wrap');
+    if (!before) { wrap.innerHTML = ''; return; }
+    const carry = round2(justineTotals(before).savings);
+    const lbl = new Date(before.month_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' });
+    if (round2(+$('#f-prev').value || 0) === carry) { wrap.innerHTML = `<div class="carry-note">✓ Matches what ${lbl} ended with</div>`; return; }
+    wrap.innerHTML = `<button type="button" class="carry-btn" id="carry-btn">↩ Use ${PESO(carry)} — what ${lbl} ended with</button>`;
+    $('#carry-btn').onclick = () => { $('#f-prev').value = carry; updateCarry(); };
+  };
+  $('#f-month').onchange = updateCarry;
+  $('#f-prev').oninput = updateCarry;
+  updateCarry();
+
   $('#modal-save').onclick = async () => {
     const monthVal = $('#f-month').value; // "2026-08"
     if (!monthVal) { toast('Pick a month'); return; }
     const payload = {
       month_date: monthVal + '-01',
       paycheck_budget: +$('#f-budget').value || 0,
+      previous_savings: +$('#f-prev').value || 0,
       bpi_total: +$('#f-bpi').value || 0,
       eastwest_total: +$('#f-ew').value || 0,
     };
     let error;
     if (isEdit) ({ error } = await db.from('justine_months').update(payload).eq('id', m.id));
     else ({ error } = await db.from('justine_months').insert(payload));
+    if (error) { toast(error.message, { error: true }); return; }
+    closeModal(); await loadAll(); renderView();
+  };
+}
+
+function openJustineIncomeModal(item, monthId) {
+  const isEdit = !!item;
+  const i = item || { label: '', amount: '' };
+  showModal(`
+    <h3>${isEdit ? 'Edit' : 'Add'} income line</h3>
+    <div class="field-row">
+      <div class="field"><label>Label</label><input type="text" id="f-label" value="${i.label ? escapeHtml(i.label) : ''}" placeholder="e.g. Bonus, Side gig"></div>
+      <div class="field"><label>Amount</label><input type="number" step="0.01" id="f-amount" value="${i.amount}"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-save">Save</button>
+    </div>
+  `);
+  $('#modal-save').onclick = async () => {
+    const payload = { label: $('#f-label').value.trim(), amount: +$('#f-amount').value || 0, month_id: monthId };
+    if (!payload.label) { toast('Add a label'); return; }
+    let error;
+    if (isEdit) ({ error } = await db.from('justine_income_items').update(payload).eq('id', i.id));
+    else ({ error } = await db.from('justine_income_items').insert(payload));
     if (error) { toast(error.message, { error: true }); return; }
     closeModal(); await loadAll(); renderView();
   };
