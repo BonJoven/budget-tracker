@@ -316,11 +316,13 @@ function renderSidebar() {
     <button class="nav-btn" data-view="summary">Summary</button>
     <button class="nav-btn" data-view="transactions">Transactions</button>
     <button class="nav-btn" data-view="installments">Installments</button>
+    <button class="nav-btn" data-view="forecast">Forecast</button>
     <button class="nav-btn" data-view="settings">Cards & Settings</button>
   `;
   const justineNav = `
     <button class="nav-btn" data-view="summary">Summary</button>
     <button class="nav-btn" data-view="installments">Installments</button>
+    <button class="nav-btn" data-view="forecast">Forecast</button>
   `;
   $('#sidebar').innerHTML = `
     <div class="brand"><span class="dot"></span> Household Budget</div>
@@ -368,12 +370,14 @@ function renderView() {
   if (state.profile === 'justine') {
     if (state.view === 'summary') renderJustineSummary();
     else if (state.view === 'installments') renderInstallments();
+    else if (state.view === 'forecast') renderForecast();
     else renderJustineSummary();
     return;
   }
   if (state.view === 'summary') renderSummary();
   else if (state.view === 'transactions') renderTransactions();
   else if (state.view === 'installments') renderInstallments();
+  else if (state.view === 'forecast') renderForecast();
   else if (state.view === 'settings') renderSettings();
 }
 
@@ -1973,6 +1977,525 @@ function openInstallModal(item) {
     }
     closeModal(); await loadAll(); renderView();
   };
+}
+
+/* ---------------- FORECAST VIEW ----------------
+   The next 6 months of pay periods: what's already locked in (installments,
+   shares people owe you, anything recorded in an existing period) against your
+   salary, plus a what-if for a new installment or balance conversion. The
+   assumptions are per-browser and never touch the database. */
+
+const FORECAST_KEY = 'budget_forecast';
+function forecastAssumptions() {
+  const latestSalary = type => {
+    const p = state.periods.filter(x => !x.archived && x.period_type === type && Number(x.salary) > 0)
+      .sort((a, b) => b.period_date.localeCompare(a.period_date))[0];
+    return p ? Number(p.salary) : 0;
+  };
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(FORECAST_KEY) || '{}'); } catch (e) { saved = {}; }
+  return {
+    sal15: latestSalary('15th'), sal30: latestSalary('30th'), other15: 0, other30: 0, startCash: 0,
+    wiOn: false, wiAmount: 0, wiMonths: 6, wiRate: 1, wiFirst: '', wiTakeoff: '',
+    ...saved,
+  };
+}
+function saveForecastAssumptions(a) {
+  try { localStorage.setItem(FORECAST_KEY, JSON.stringify(a)); } catch (e) { /* private mode */ }
+}
+
+// The next 12 pay dates (6 months), skipping any that have already passed.
+function forecastSlots() {
+  const today = toLocalISODate(new Date());
+  const now = new Date();
+  const slots = [];
+  for (let k = 0; slots.length < 12 && k < 8; k++) {
+    const d = new Date(now.getFullYear(), now.getMonth() + k, 1);
+    const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    [['15th', `${mk}-15`], ['30th', `${mk}-${String(Math.min(30, last)).padStart(2, '0')}`]].forEach(([type, date]) => {
+      if (date >= today && slots.length < 12) slots.push({ mk, type, date, key: `${mk}|${type}` });
+    });
+  }
+  return slots;
+}
+const addMonths = (mk, n) => {
+  const [y, m] = mk.split('-').map(Number);
+  const d = new Date(y, m - 1 + n, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+};
+const slotLabel = (mk, type) => {
+  const last = new Date(Number(mk.slice(0, 4)), Number(mk.slice(5, 7)), 0).getDate();
+  return `${new Date(mk + '-01T00:00:00').toLocaleDateString('en-PH', { month: 'short' })} ${type === '15th' ? 15 : Math.min(30, last)}`;
+};
+// Average of what was actually charged (non-installment transactions) on the
+// last few recorded periods of a type - a realistic starting point for
+// "Other spending" in projected periods.
+function averageRecordedSpending(type, n = 3) {
+  const ps = state.periods.filter(p => !p.archived && p.period_type === type)
+    .filter(p => state.transactions.some(t => t.period_id === p.id))
+    .sort((a, b) => b.period_date.localeCompare(a.period_date)).slice(0, n);
+  if (!ps.length) return null;
+  const total = ps.reduce((sum, p) => sum + state.transactions.filter(t => t.period_id === p.id).reduce((s2, t) => s2 + Number(t.amount), 0), 0);
+  return { avg: round2(total / ps.length), count: ps.length };
+}
+
+// Installment-driven numbers for one pay period, whether or not the period
+// exists yet: what you pay, and what Justine / others owe you for it.
+function fixedForSlot(mk, type) {
+  const r = { out: 0, byCard: new Map(), justine: 0, others: new Map() };
+  state.installments.filter(i => !i.archived).forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      const k = periodKeyForDate(row.due_date);
+      if (k.mk !== mk || k.type !== type) return;
+      const share = totalWifeyShareForRow(inst, row);
+      if (inst.owner === 'joven') {
+        const amt = totalAmountForRow(inst, row);
+        r.out += amt;
+        const ck = inst.card_id || 'gl';
+        r.byCard.set(ck, (r.byCard.get(ck) || 0) + amt);
+        if (share > 0) {
+          if (isJustineShare(inst)) r.justine += share;
+          else { const who = shareHolder(inst); r.others.set(who, (r.others.get(who) || 0) + share); }
+        }
+      } else if (share > 0) {
+        r.justine -= share; // one of her plans that you cover - reduces what she owes
+      }
+    });
+  });
+  return r;
+}
+function existingPeriodFor(mk, type) {
+  return state.periods.find(p => !p.archived && p.period_type === type && monthKey(p.period_date) === mk) || null;
+}
+// What Justine owes for one pay period's charges (counted on the 30th).
+function justineOwnForSlot(mk, type) {
+  const p = existingPeriodFor(mk, type);
+  return p ? wifeyTotalForPeriod(p.id) : fixedForSlot(mk, type).justine;
+}
+
+function computeForecast(a) {
+  const slots = forecastSlots();
+  const wiMonthly = a.wiOn && a.wiAmount > 0 && a.wiMonths > 0
+    ? round2(a.wiAmount * (1 + (a.wiRate / 100) * a.wiMonths) / a.wiMonths) : 0;
+  const [wiMk, wiType] = (a.wiFirst || '').split('|');
+  let running = Number(a.startCash) || 0;
+  const rows = slots.map((slot, i) => {
+    const { mk, type } = slot;
+    const existing = existingPeriodFor(mk, type);
+    const label = slotLabel(mk, type);
+    const axis = { label, axis1: label.split(' ')[1], axisSub: type === '15th' || i === 0 ? label.split(' ')[0] : '' };
+    const inLines = [], outLines = [];
+    const assumedSalary = type === '15th' ? Number(a.sal15) || 0 : Number(a.sal30) || 0;
+    if (existing) {
+      const t = periodTotals(existing);
+      const recSalary = Number(existing.salary) || 0;
+      inLines.push({ label: recSalary ? 'Salary' : 'Salary (assumed)', amount: recSalary || assumedSalary });
+      t.otherShares.forEach(o => inLines.push({ label: o.person, amount: o.amount, tag: 'installment share' }));
+      if (t.extraIncome) inLines.push({ label: 'Income lines', amount: t.extraIncome });
+      state.cards.forEach(c => { const v = cardTotalForPeriod(c.id, existing.id); if (v) outLines.push({ label: c.name, amount: v, color: c.color }); });
+      const gl = generalLedgerInstallmentTotalForPeriod(existing.id);
+      if (gl) outLines.push({ label: 'General ledger', amount: gl });
+    } else {
+      const f = fixedForSlot(mk, type);
+      inLines.push({ label: 'Salary (assumed)', amount: assumedSalary });
+      [...f.others.entries()].forEach(([who, v]) => inLines.push({ label: who, amount: v, tag: 'installment share' }));
+      [...f.byCard.entries()].forEach(([ck, v]) => {
+        const c = state.cards.find(x => x.id === ck);
+        outLines.push({ label: c ? c.name : 'General ledger', amount: v, color: c ? c.color : null, tag: 'installments' });
+      });
+    }
+    if (type === '30th') {
+      const j = justineOwnForSlot(mk, '15th') + justineOwnForSlot(mk, '30th');
+      if (j) inLines.push({ label: 'Justine (15th + 30th)', amount: j });
+    }
+    // "Other spending" stands in for bills that haven't been entered yet, so it
+    // only applies to periods with no real transactions recorded.
+    const hasBills = !!existing && state.transactions.some(t => t.period_id === existing.id);
+    const other = hasBills ? 0 : (type === '15th' ? Number(a.other15) || 0 : Number(a.other30) || 0);
+    if (other) outLines.push({ label: 'Other spending', amount: other, tag: 'assumption' });
+    if (wiMonthly && type === wiType) {
+      const idx = (Number(mk.slice(0, 4)) - Number(wiMk.slice(0, 4))) * 12 + (Number(mk.slice(5, 7)) - Number(wiMk.slice(5, 7)));
+      if (idx >= 0 && idx < a.wiMonths) outLines.push({ label: `What-if payment ${idx + 1}/${a.wiMonths}`, amount: wiMonthly, tag: 'what-if' });
+    }
+    if (a.wiOn && a.wiAmount > 0 && a.wiTakeoff === slot.key) {
+      outLines.push({ label: 'Balance converted (taken off this bill)', amount: -Number(a.wiAmount), tag: 'what-if' });
+    }
+    const totalIn = inLines.reduce((s2, l) => s2 + l.amount, 0);
+    const totalOut = outLines.reduce((s2, l) => s2 + l.amount, 0);
+    const net = totalIn - totalOut;
+    running += net;
+    return { ...slot, ...axis, recorded: hasBills, inLines, outLines, totalIn, totalOut, net, running };
+  });
+  const wiInterest = wiMonthly ? round2(wiMonthly * a.wiMonths - a.wiAmount) : 0;
+  return { rows, wiMonthly, wiInterest };
+}
+
+function forecastChartSvg(rows, width) {
+  // Drawn at the container's real width so text stays readable on phones.
+  const W = Math.max(320, Math.min(900, Math.round(width || 760))), H = W < 500 ? 220 : 240, padL = 52, padR = 12, padT = 16, padB = 40;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const vals = rows.flatMap(r => [r.net, r.running]).concat(0);
+  let max = Math.max(...vals), min = Math.min(...vals);
+  if (max === min) { max += 1000; min -= 1000; }
+  const span = max - min; max += span * 0.08; min -= span * 0.08;
+  const y = v => padT + (max - v) / (max - min) * innerH;
+  const band = innerW / rows.length;
+  const bw = Math.min(28, band * 0.55);
+  const short = n => { const a2 = Math.abs(n); return (n < 0 ? '-' : '') + '₱' + (a2 >= 1000 ? (a2 / 1000).toFixed(a2 >= 10000 ? 0 : 1) + 'k' : Math.round(a2)); };
+  // ~4 tidy gridlines
+  const rawStep = (max - min) / 4;
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(st => st >= rawStep);
+  const ticks = [];
+  for (let v = Math.ceil(min / step) * step; v <= max; v += step) ticks.push(v);
+  const bars = rows.map((r, i) => {
+    const cx = padL + band * i + band / 2;
+    const y0 = y(0), y1 = y(r.net);
+    const h = Math.max(Math.abs(y1 - y0), 1);
+    const top = Math.min(y0, y1);
+    const rad = Math.min(4, h / 2, bw / 2);
+    // Rounded only at the data end, square on the zero line.
+    const x0 = cx - bw / 2, x1 = cx + bw / 2;
+    const d = r.net >= 0
+      ? `M${x0},${y0} V${top + rad} Q${x0},${top} ${x0 + rad},${top} H${x1 - rad} Q${x1},${top} ${x1},${top + rad} V${y0} Z`
+      : `M${x0},${y0} V${top + h - rad} Q${x0},${top + h} ${x0 + rad},${top + h} H${x1 - rad} Q${x1},${top + h} ${x1},${top + h - rad} V${y0} Z`;
+    return `<path d="${d}" fill="${r.net >= 0 ? 'var(--fc-pos)' : 'var(--fc-neg)'}"></path>`;
+  }).join('');
+  const pts = rows.map((r, i) => [padL + band * i + band / 2, y(r.running)]);
+  const line = `<polyline points="${pts.map(p2 => p2.join(',')).join(' ')}" fill="none" stroke="var(--fc-line)" stroke-width="2" stroke-linejoin="round"></polyline>`;
+  const dots = pts.map(([x, yy]) => `<circle cx="${x}" cy="${yy}" r="4" fill="var(--fc-line)" stroke="var(--surface)" stroke-width="2"></circle>`).join('');
+  const lowIdx = rows.reduce((bi, r, i) => r.running < rows[bi].running ? i : bi, 0);
+  const lowY = pts[lowIdx][1];
+  const lowLabel = rows[lowIdx].running < 0
+    ? `<text x="${Math.min(pts[lowIdx][0], W - padR - 30)}" y="${lowY > H - padB - 26 ? lowY - 12 : lowY + 18}" text-anchor="middle" class="fc-ann">low ${short(rows[lowIdx].running)}</text>` : '';
+  const xLabels = rows.map((r, i) => {
+    const cx = padL + band * i + band / 2;
+    return `<text x="${cx}" y="${H - padB + 16}" text-anchor="middle" class="fc-axis">${r.axis1}</text>` +
+      (r.axisSub ? `<text x="${cx}" y="${H - padB + 31}" text-anchor="middle" class="fc-axis fc-month">${r.axisSub}</text>` : '');
+  }).join('');
+  const hits = rows.map((r, i) => `<rect class="fc-hit" data-fc-i="${i}" x="${padL + band * i}" y="${padT}" width="${band}" height="${innerH}" fill="transparent"><title>${r.label}: net ${PESO(r.net)}, running ${PESO(r.running)}</title></rect>`).join('');
+  return `
+    <svg viewBox="0 0 ${W} ${H}" class="fc-chart" role="img" aria-label="Net per pay period and running balance for the next 6 months">
+      ${ticks.map(v => `<line x1="${padL}" x2="${W - padR}" y1="${y(v)}" y2="${y(v)}" class="${v === 0 ? 'fc-zero' : 'fc-grid'}"></line><text x="${padL - 8}" y="${y(v) + 4}" text-anchor="end" class="fc-axis">${short(v)}</text>`).join('')}
+      ${ticks.includes(0) ? '' : `<line x1="${padL}" x2="${W - padR}" y1="${y(0)}" y2="${y(0)}" class="fc-zero"></line>`}
+      ${bars}${line}${dots}${lowLabel}${xLabels}${hits}
+    </svg>`;
+}
+
+/* ---- Justine's side: one row per calendar month, matching her Summary ---- */
+
+const JFORECAST_KEY = 'budget_forecast_justine';
+function justineForecastAssumptions() {
+  const latest = state.justineMonths.filter(m => !m.archived).sort((x, y) => y.month_date.localeCompare(x.month_date))[0];
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(JFORECAST_KEY) || '{}'); } catch (e) { saved = {}; }
+  return {
+    pay: latest ? Number(latest.paycheck_budget) || 0 : 0,
+    bills: latest ? round2(justineBillsForMonth(latest.id).reduce((s2, b) => s2 + Number(b.amount), 0)) : 0,
+    other: 0, startCash: 0,
+    wiOn: false, wiAmount: 0, wiMonths: 6, wiRate: 1, wiFirst: '', wiTakeoff: '',
+    ...saved,
+  };
+}
+function justineForecastSlots() {
+  const now = new Date();
+  return Array.from({ length: 6 }, (_, k) => {
+    const d = new Date(now.getFullYear(), now.getMonth() + k, 1);
+    const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    return { mk, type: 'month', key: mk };
+  });
+}
+const monthLabelShort = mk => new Date(mk + '-01T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' });
+function justineMonthRecorded(m) {
+  return !!m && (Number(m.bpi_total) > 0 || Number(m.eastwest_total) > 0 || justineBillsForMonth(m.id).length > 0);
+}
+// Her own installments due in a month, by card (no card = General Ledger).
+function justineInstallmentsForMonth(mk) {
+  const byCard = new Map();
+  let gl = 0;
+  state.installments.filter(i => !i.archived && i.owner === 'justine').forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      if (monthKey(row.due_date) !== mk) return;
+      const amt = totalAmountForRow(inst, row);
+      if (inst.card_id) byCard.set(inst.card_id, (byCard.get(inst.card_id) || 0) + amt); else gl += amt;
+    });
+  });
+  return { byCard, gl };
+}
+// Her average BPI + Eastwest spending beyond installments, from recorded months.
+function averageJustineCardSpending(n = 3) {
+  const named = name => state.cards.find(c => c.name.toLowerCase() === name);
+  const bpi = named('bpi'), ew = named('eastwest');
+  const ms = state.justineMonths.filter(m => !m.archived && (Number(m.bpi_total) > 0 || Number(m.eastwest_total) > 0))
+    .sort((x, y) => y.month_date.localeCompare(x.month_date)).slice(0, n);
+  if (!ms.length) return null;
+  const total = ms.reduce((sum, m) => {
+    const inst = justineInstallmentsForMonth(monthKey(m.month_date)).byCard;
+    const instOnThese = (bpi ? inst.get(bpi.id) || 0 : 0) + (ew ? inst.get(ew.id) || 0 : 0);
+    return sum + Math.max(Number(m.bpi_total) + Number(m.eastwest_total) - instOnThese, 0);
+  }, 0);
+  return { avg: round2(total / ms.length), count: ms.length };
+}
+
+function computeJustineForecast(a) {
+  const slots = justineForecastSlots();
+  const wiMonthly = a.wiOn && a.wiAmount > 0 && a.wiMonths > 0
+    ? round2(a.wiAmount * (1 + (a.wiRate / 100) * a.wiMonths) / a.wiMonths) : 0;
+  let running = Number(a.startCash) || 0;
+  const rows = slots.map((slot, i) => {
+    const { mk } = slot;
+    const m = state.justineMonths.find(x => !x.archived && monthKey(x.month_date) === mk);
+    const recorded = justineMonthRecorded(m);
+    const inLines = [], outLines = [];
+    const recPay = m ? Number(m.paycheck_budget) || 0 : 0;
+    inLines.push({ label: recPay ? 'Paycheck budget' : 'Paycheck budget (assumed)', amount: recPay || Number(a.pay) || 0 });
+    // What she owes Joven this month - from his tracker where it exists, else from shared installments.
+    const jovenCc = justineOwnForSlot(mk, '15th') + justineOwnForSlot(mk, '30th');
+    if (jovenCc) outLines.push({ label: 'Joven CC total', amount: jovenCc, tag: 'from his tracker' });
+    if (recorded) {
+      if (Number(m.bpi_total)) outLines.push({ label: 'BPI', amount: Number(m.bpi_total), color: (state.cards.find(c => c.name.toLowerCase() === 'bpi') || {}).color });
+      if (Number(m.eastwest_total)) outLines.push({ label: 'Eastwest', amount: Number(m.eastwest_total), color: (state.cards.find(c => c.name.toLowerCase() === 'eastwest') || {}).color });
+      const gl = justineGeneralLedgerTotalForMonth(m.month_date);
+      if (gl) outLines.push({ label: 'General ledger', amount: gl });
+      justineBillsForMonth(m.id).forEach(b => { if (Number(b.amount)) outLines.push({ label: b.label, amount: Number(b.amount), tag: 'bill' }); });
+    } else {
+      const inst = justineInstallmentsForMonth(mk);
+      [...inst.byCard.entries()].forEach(([cid, v]) => {
+        const c = state.cards.find(x => x.id === cid);
+        outLines.push({ label: c ? c.name : 'Card', amount: v, color: c ? c.color : null, tag: 'installments' });
+      });
+      if (inst.gl) outLines.push({ label: 'General ledger', amount: inst.gl, tag: 'installments' });
+      if (Number(a.bills)) outLines.push({ label: 'Monthly bills', amount: Number(a.bills), tag: 'assumption' });
+      if (Number(a.other)) outLines.push({ label: 'Other spending', amount: Number(a.other), tag: 'assumption' });
+    }
+    if (wiMonthly && a.wiFirst) {
+      const idx = (Number(mk.slice(0, 4)) - Number(a.wiFirst.slice(0, 4))) * 12 + (Number(mk.slice(5, 7)) - Number(a.wiFirst.slice(5, 7)));
+      if (idx >= 0 && idx < a.wiMonths) outLines.push({ label: `What-if payment ${idx + 1}/${a.wiMonths}`, amount: wiMonthly, tag: 'what-if' });
+    }
+    if (a.wiOn && a.wiAmount > 0 && a.wiTakeoff === mk) outLines.push({ label: 'Balance converted (taken off this bill)', amount: -Number(a.wiAmount), tag: 'what-if' });
+    const totalIn = inLines.reduce((s2, l) => s2 + l.amount, 0);
+    const totalOut = outLines.reduce((s2, l) => s2 + l.amount, 0);
+    const net = totalIn - totalOut;
+    running += net;
+    const label = monthLabelShort(mk);
+    return {
+      ...slot, label, axis1: label.split(' ')[0], axisSub: i === 0 || mk.endsWith('-01') ? mk.slice(0, 4) : '',
+      recorded, inLines, outLines, totalIn, totalOut, net, running,
+    };
+  });
+  const wiInterest = wiMonthly ? round2(wiMonthly * a.wiMonths - a.wiAmount) : 0;
+  return { rows, wiMonthly, wiInterest };
+}
+
+function renderJustineForecast() {
+  const main = $('#main');
+  const a = justineForecastAssumptions();
+  const slots = justineForecastSlots();
+  if (!a.wiFirst || !slots.some(x => x.key === a.wiFirst)) a.wiFirst = slots[0].key;
+  const opts = (sel, withNone) => (withNone ? `<option value="" ${!sel ? 'selected' : ''}>— nothing (it's a new purchase)</option>` : '') +
+    slots.map(x => `<option value="${x.key}" ${x.key === sel ? 'selected' : ''}>${monthLabelShort(x.mk)}</option>`).join('');
+  const avg = averageJustineCardSpending();
+  const num = (id, label, val, hint) => `<div class="field"><label>${label}</label><input type="number" step="0.01" id="${id}" value="${val}">${hint ? `<div class="fc-hint">${hint}</div>` : ''}</div>`;
+  main.innerHTML = `
+    <h2>Forecast</h2>
+    <div class="subtitle">Justine's next 6 months: paycheck against what's already locked in (her installments, the Joven CC total, monthly bills). Nothing here is saved to the database.</div>
+
+    <div class="section-card">
+      <div class="sh"><h3>Assumptions</h3></div>
+      <div class="fc-grid-inputs">
+        ${num('fj-pay', 'Paycheck budget / month', a.pay)}
+        ${num('fj-bills', 'Monthly bills', a.bills, 'from her latest month (Papa, PLDT…)')}
+        ${num('fj-other', 'Other spending / month', a.other, avg ? `card buys beyond installments · <button type="button" class="fc-use" id="fj-use" data-v="${avg.avg}">use her avg ${PESO(avg.avg)}</button>` : 'card buys beyond installments, cash…')}
+        ${num('fj-start', 'Starting cash', a.startCash, 'what she has on hand today')}
+      </div>
+    </div>
+
+    <div class="section-card fc-whatif ${a.wiOn ? 'on' : ''}">
+      <label class="fc-toggle"><input type="checkbox" id="fc-wi-on" ${a.wiOn ? 'checked' : ''}> <span><b>What-if</b> — a new installment or a balance conversion</span></label>
+      <div class="fc-grid-inputs">
+        ${num('fc-wi-amount', 'Amount (principal)', a.wiAmount || '')}
+        <div class="field"><label>Months</label><input type="number" id="fc-wi-months" value="${a.wiMonths}" min="1"></div>
+        ${num('fc-wi-rate', 'Add-on rate % per month', a.wiRate, 'ask the bank; 0 for 0% plans')}
+        <div class="field"><label>First payment</label><select id="fc-wi-first">${opts(a.wiFirst, false)}</select></div>
+        <div class="field"><label>Takes the amount off</label><select id="fc-wi-takeoff">${opts(a.wiTakeoff, true)}</select><div class="fc-hint">for a conversion: the bill it replaces</div></div>
+      </div>
+      <div id="fc-wi-summary" class="fc-wi-summary"></div>
+    </div>
+
+    <div id="fc-results"></div>
+  `;
+  const read = () => {
+    const v = id => +$(id).value || 0;
+    Object.assign(a, {
+      pay: v('#fj-pay'), bills: v('#fj-bills'), other: v('#fj-other'), startCash: v('#fj-start'),
+      wiOn: $('#fc-wi-on').checked, wiAmount: v('#fc-wi-amount'), wiMonths: Math.max(1, Math.round(v('#fc-wi-months')) || 1),
+      wiRate: v('#fc-wi-rate'), wiFirst: $('#fc-wi-first').value, wiTakeoff: $('#fc-wi-takeoff').value,
+    });
+    try { localStorage.setItem(JFORECAST_KEY, JSON.stringify(a)); } catch (e) { /* private mode */ }
+    $('.fc-whatif').classList.toggle('on', a.wiOn);
+    renderForecastResults(a);
+  };
+  if ($('#fj-use')) $('#fj-use').onclick = () => { $('#fj-other').value = $('#fj-use').dataset.v; read(); };
+  $$('#main .fc-grid-inputs input, #main .fc-grid-inputs select, #fc-wi-on').forEach(el => el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', read));
+  renderForecastResults(a);
+}
+
+function renderForecast() {
+  if (state.profile === 'justine') { renderJustineForecast(); return; }
+  const main = $('#main');
+  const a = forecastAssumptions();
+  const slots = forecastSlots();
+  if (!a.wiFirst || !slots.some(x => x.key === a.wiFirst)) a.wiFirst = (slots.find(x => x.type === '30th') || slots[0]).key;
+  const slotOptions = (sel, withNone) => (withNone ? `<option value="" ${!sel ? 'selected' : ''}>— nothing (it's a new purchase)</option>` : '') +
+    slots.map(x => `<option value="${x.key}" ${x.key === sel ? 'selected' : ''}>${slotLabel(x.mk, x.type)}, ${x.mk.slice(0, 4)}</option>`).join('');
+  const avgHint = type => {
+    const r = averageRecordedSpending(type);
+    return r ? `new card buys, cash, bills · <button type="button" class="fc-use" data-fc-use="${type}" data-v="${r.avg}">use your avg ${PESO(r.avg)}</button>` : 'new card buys, cash, bills not in the tracker';
+  };
+  const num = (id, label, val, hint) => `<div class="field"><label>${label}</label><input type="number" step="0.01" id="${id}" value="${val}">${hint ? `<div class="fc-hint">${hint}</div>` : ''}</div>`;
+  main.innerHTML = `
+    <h2>Forecast</h2>
+    <div class="subtitle">The next 6 months of pay periods: everything already locked in (installments, shares owed to you, anything recorded) against your salary. Nothing here is saved to the database.</div>
+
+    <div class="section-card">
+      <div class="sh"><h3>Assumptions</h3></div>
+      <div class="fc-grid-inputs">
+        ${num('fc-sal15', '15th salary', a.sal15)}
+        ${num('fc-sal30', '30th salary', a.sal30)}
+        ${num('fc-other15', 'Other spending · 15th', a.other15, avgHint('15th'))}
+        ${num('fc-other30', 'Other spending · 30th', a.other30, avgHint('30th'))}
+        ${num('fc-start', 'Starting cash', a.startCash, 'what you have on hand today')}
+      </div>
+    </div>
+
+    <div class="section-card fc-whatif ${a.wiOn ? 'on' : ''}">
+      <label class="fc-toggle"><input type="checkbox" id="fc-wi-on" ${a.wiOn ? 'checked' : ''}> <span><b>What-if</b> — a new installment or a balance conversion</span></label>
+      <div class="fc-grid-inputs" id="fc-wi-fields">
+        ${num('fc-wi-amount', 'Amount (principal)', a.wiAmount || '')}
+        <div class="field"><label>Months</label><input type="number" id="fc-wi-months" value="${a.wiMonths}" min="1"></div>
+        ${num('fc-wi-rate', 'Add-on rate % per month', a.wiRate, 'ask the bank; 0 for 0% plans')}
+        <div class="field"><label>First payment</label><select id="fc-wi-first">${slotOptions(a.wiFirst, false)}</select></div>
+        <div class="field"><label>Takes the amount off</label><select id="fc-wi-takeoff">${slotOptions(a.wiTakeoff, true)}</select><div class="fc-hint">for a conversion: the bill it replaces</div></div>
+      </div>
+      <div id="fc-wi-summary" class="fc-wi-summary"></div>
+    </div>
+
+    <div id="fc-results"></div>
+  `;
+
+  const read = () => {
+    const v = id => +$(id).value || 0;
+    Object.assign(a, {
+      sal15: v('#fc-sal15'), sal30: v('#fc-sal30'), other15: v('#fc-other15'), other30: v('#fc-other30'), startCash: v('#fc-start'),
+      wiOn: $('#fc-wi-on').checked, wiAmount: v('#fc-wi-amount'), wiMonths: Math.max(1, Math.round(v('#fc-wi-months')) || 1),
+      wiRate: v('#fc-wi-rate'), wiFirst: $('#fc-wi-first').value, wiTakeoff: $('#fc-wi-takeoff').value,
+    });
+    saveForecastAssumptions(a);
+    $('.fc-whatif').classList.toggle('on', a.wiOn);
+    renderForecastResults(a);
+  };
+  $$('[data-fc-use]').forEach(b => b.onclick = () => {
+    const inp = $(b.dataset.fcUse === '15th' ? '#fc-other15' : '#fc-other30');
+    inp.value = b.dataset.v;
+    read();
+  });
+  $$('#main .fc-grid-inputs input, #main .fc-grid-inputs select, #fc-wi-on').forEach(el => el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', read));
+  renderForecastResults(a);
+}
+
+function renderForecastResults(a) {
+  const isJ = state.profile === 'justine';
+  const unit1 = isJ ? 'month' : 'pay period', unitN = isJ ? 'months' : 'pay periods';
+  const { rows, wiMonthly, wiInterest } = isJ ? computeJustineForecast(a) : computeForecast(a);
+  const wrap = $('#fc-results');
+  if (!rows.length) { wrap.innerHTML = `<div class="empty-state">Nothing to forecast.</div>`; return; }
+
+  $('#fc-wi-summary').innerHTML = a.wiOn && wiMonthly
+    ? `${PESO(wiMonthly)}/mo × ${a.wiMonths} = ${PESO(wiMonthly * a.wiMonths)} · costs <b>${PESO(wiInterest)}</b> in add-on interest${a.wiTakeoff ? '' : ' · nothing taken off (new purchase)'}`
+    : a.wiOn ? 'Enter an amount to see its effect.' : '';
+
+  const low = rows.reduce((b, r) => r.running < b.running ? r : b, rows[0]);
+  const lowIdx = rows.indexOf(low);
+  const recoverRow = low.running < 0 ? rows.slice(lowIdx).find(r => r.running >= 0) : null;
+  const months = isJ ? rows.length : rows.length / 2;
+  const avgNet = rows.reduce((s2, r) => s2 + r.net, 0) / months;
+  const negatives = rows.filter(r => r.net < 0).length;
+
+  const noSpending = (isJ ? !Number(a.other) : !Number(a.other15) && !Number(a.other30)) && rows.some(r => !r.recorded);
+  wrap.innerHTML = `
+    ${noSpending ? `<div class="fc-warn">⚠ Projected periods assume <b>no new spending</b> — only installments. Set "Other spending" above (the "use your avg" ${isJ ? 'link is' : 'buttons are'} a quick start), or this will look better than it really is.</div>` : ''}
+    <div class="dash-stats">
+      <div class="stat-card"><div class="stat-label">Lowest point</div><div class="stat-value" style="color:${low.running < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(low.running)}</div><div class="stat-note">running balance, ${low.label}</div></div>
+      <div class="stat-card"><div class="stat-label">Back above zero</div><div class="stat-value">${low.running >= 0 ? 'Never below' : recoverRow ? recoverRow.label : 'Not in 6 mo'}</div><div class="stat-note">${low.running >= 0 ? 'stays positive throughout' : recoverRow ? `first ${unit1} the balance recovers` : 'still negative at the end'}</div></div>
+      <div class="stat-card"><div class="stat-label">Average net / month</div><div class="stat-value" style="color:${avgNet < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(avgNet)}</div><div class="stat-note">${negatives} of ${rows.length} ${unitN} negative</div></div>
+      <div class="stat-card"><div class="stat-label">End of forecast</div><div class="stat-value" style="color:${rows[rows.length - 1].running < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(rows[rows.length - 1].running)}</div><div class="stat-note">${rows[rows.length - 1].label}</div></div>
+    </div>
+
+    <div class="section-card">
+      <div class="sh"><h3>Net per ${unit1} &amp; running balance</h3></div>
+      <div class="fc-legend">
+        <span><i class="fc-key-bar"></i>Net per ${unit1} <em>(blue above zero, red below)</em></span>
+        <span><i class="fc-key-line"></i>Running balance</span>
+      </div>
+      <div class="fc-chart-wrap" id="fc-chart-wrap"><div class="fc-tip" id="fc-tip"></div></div>
+    </div>
+
+    <div class="section-card">
+      <div class="sh"><h3>${isJ ? 'Months' : 'Pay periods'}</h3><span class="fc-hint">click a row for the breakdown</span></div>
+      <table class="fc-table">
+        <thead><tr><th>${isJ ? 'Month' : 'Period'}</th><th class="num">In</th><th class="num">Out</th><th class="num">Net</th><th class="num">Running</th></tr></thead>
+        <tbody>
+          ${rows.map((r, i) => `
+            <tr class="fc-row" data-fc-row="${i}">
+              <td><span class="fc-caret">▸</span> ${r.label} <span class="synced-badge" style="${r.recorded ? '' : 'color:var(--text-dim);background:rgba(141,149,171,.14);'}">${r.recorded ? 'recorded' : 'projected'}</span></td>
+              <td class="num">${PESO(r.totalIn)}</td>
+              <td class="num">${PESO(r.totalOut)}</td>
+              <td class="num" style="color:${r.net < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(r.net)}</td>
+              <td class="num" style="font-weight:700;">${PESO(r.running)}</td>
+            </tr>
+            <tr class="fc-detail" data-fc-detail="${i}" hidden>
+              <td colspan="5">
+                <div class="fc-detail-grid">
+                  <div><div class="flow-head" style="color:var(--green);">↓ In</div>${r.inLines.map(l => `<div class="fc-dl"><span>${escapeHtml(l.label)}${l.tag ? ` <em>${l.tag}</em>` : ''}</span><span>${PESO(l.amount)}</span></div>`).join('') || '<div class="fc-dl"><span>—</span></div>'}</div>
+                  <div><div class="flow-head" style="color:var(--red);">↑ Out</div>${r.outLines.map(l => `<div class="fc-dl"><span>${l.color ? `<i class="sw" style="background:${l.color}"></i>` : ''}${escapeHtml(l.label)}${l.tag ? ` <em>${l.tag}</em>` : ''}</span><span>${PESO(l.amount)}</span></div>`).join('') || '<div class="fc-dl"><span>Nothing locked in yet</span></div>'}</div>
+                </div>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+      ${isJ ? `<p class="fc-hint" style="margin-top:10px;">"Recorded" = the month already has BPI / Eastwest totals or bills entered, so it matches your Summary card. "Projected" = your paycheck, your installments (every card), monthly bills and other spending from the assumptions, plus the Joven CC total worked out from his tracker. The running balance starts from "Starting cash".</p>` : ''}<p class="fc-hint" style="margin-top:10px;${isJ ? 'display:none;' : ''}">"Recorded" = the period already has bills entered, so those are used as-is. "Projected" = only installments, shares owed to you and your assumptions, with "Other spending" standing in for the bills not entered yet. Previous savings are ignored; the running balance starts from "Starting cash".</p>
+    </div>
+  `;
+
+  const chartWrap0 = $('#fc-chart-wrap');
+  chartWrap0.insertAdjacentHTML('afterbegin', forecastChartSvg(rows, chartWrap0.clientWidth));
+
+  $$('[data-fc-row]').forEach(tr => tr.onclick = e => {
+    if (window.getSelection().toString()) return;
+    const d = $(`[data-fc-detail="${tr.dataset.fcRow}"]`);
+    d.hidden = !d.hidden;
+    tr.classList.toggle('open', !d.hidden);
+  });
+
+  // Hover tooltip on the chart (the <title> inside each hit area is the fallback).
+  const tip = $('#fc-tip'), chartWrap = $('#fc-chart-wrap');
+  $$('.fc-hit').forEach(h => {
+    h.addEventListener('mouseenter', () => {
+      const r = rows[+h.dataset.fcI];
+      tip.innerHTML = `<b>${r.label}</b> <span>${r.recorded ? 'recorded' : 'projected'}</span>
+        <div><span>In</span><span>${PESO(r.totalIn)}</span></div>
+        <div><span>Out</span><span>${PESO(r.totalOut)}</span></div>
+        <div><span>Net</span><span style="color:${r.net < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(r.net)}</span></div>
+        <div><span>Running</span><span>${PESO(r.running)}</span></div>`;
+      tip.classList.add('on');
+      const box = chartWrap.getBoundingClientRect(), hb = h.getBoundingClientRect();
+      const left = Math.min(Math.max(hb.left - box.left + hb.width / 2 - 85, 0), box.width - 170);
+      tip.style.left = left + 'px';
+      h.classList.add('hover');
+    });
+    h.addEventListener('mouseleave', () => { tip.classList.remove('on'); h.classList.remove('hover'); });
+  });
 }
 
 /* ---------------- SETTINGS VIEW ---------------- */
