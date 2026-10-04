@@ -440,6 +440,13 @@ function isJovenShare(inst) {
   return inst.owner === 'justine' && shareHolder(inst).toLowerCase() === 'joven';
 }
 const possessive = name => name + (/s$/i.test(name) ? "'" : "'s");
+// When the share holder is the other spouse but someone else actually pays
+// them back (e.g. Joven's plan, Justine's share, Tanie pays Justine), this is
+// who. Returns '' when the spouse pays it themselves.
+function collectsFrom(inst) {
+  if (shareHolder(inst).toLowerCase() !== defaultSharerFor(inst.owner).toLowerCase()) return '';
+  return (inst.collect_from || '').trim();
+}
 
 // Joven's own installments surface automatically as a pinned, read-only
 // "payment plan" row on the matching card + period, sourced live from the
@@ -611,12 +618,21 @@ function wifeyTotalForPeriod(periodId) {
 // payment is due, one line per person.
 function otherShareIncomeForPeriod(periodId) {
   const byPerson = new Map();
-  virtualEntriesForPeriod(periodId).filter(e => !e.toJustine && e.wifey_share > 0).forEach(e => {
-    const key = e.holder.toLowerCase();
-    if (!byPerson.has(key)) byPerson.set(key, { person: e.holder, amount: 0, plans: [] });
+  const add = (who, amount, planLabel, via) => {
+    const key = who.toLowerCase();
+    if (!byPerson.has(key)) byPerson.set(key, { person: who, amount: 0, plans: [], via: false });
     const g = byPerson.get(key);
-    g.amount += e.wifey_share;
-    g.plans.push(`${e.description}: ${PESO(e.wifey_share)}`);
+    g.amount += amount;
+    g.plans.push(`${planLabel}: ${PESO(amount)}`);
+    if (via) g.via = true;
+  };
+  virtualEntriesForPeriod(periodId).filter(e => !e.toJustine && e.wifey_share > 0).forEach(e => add(e.holder, e.wifey_share, e.description));
+  // Justine's plans where Joven covers a share but someone else pays Joven back.
+  state.installments.filter(i => !i.archived && isJovenShare(i) && collectsFrom(i)).forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      const share = totalWifeyShareForRow(inst, row);
+      if (share > 0 && periodIdForDate(row.due_date) === periodId) add(collectsFrom(inst), share, `${inst.name} (Justine's plan)`, true);
+    });
   });
   return [...byPerson.values()].sort((a, b) => a.person.localeCompare(b.person));
 }
@@ -1592,7 +1608,7 @@ function renderInstallments() {
     if (i.archived) el.style.opacity = '.6';
     el.innerHTML = `
       <div class="name">${escapeHtml(i.name)}</div>
-      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo${Number(i.wifey_monthly_share) > 0 ? ` • <span style="color:var(--purple);">${escapeHtml(shareHolder(i))} pays ${PESO(i.wifey_monthly_share)}</span>` : ''}</div>
+      <div class="meta card-chip"><span class="sw" style="background:${card ? card.color : 'var(--blue)'}"></span>${card ? card.name : 'General Ledger'} • ${PESO(i.monthly_amount)}/mo${Number(i.wifey_monthly_share) > 0 ? ` • <span style="color:var(--purple);">${escapeHtml(shareHolder(i))} pays ${PESO(i.wifey_monthly_share)}${collectsFrom(i) ? ` (from ${escapeHtml(collectsFrom(i))})` : ''}</span>` : ''}</div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%;background:${done ? 'var(--green)' : 'var(--gold)'}"></div></div>
       <div class="foot">
         <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}${overdueCount ? ` <b style="color:var(--red);">· ${overdueCount} overdue</b>` : ''}</span>
@@ -1798,7 +1814,10 @@ function openInstallModal(item) {
   const hasShareWithCol = state.installments.some(x => 'share_with' in x);
   const defaultSharer = defaultSharerFor(state.profile);
   const holderNow = shareHolder({ ...i, owner: i.owner || state.profile });
-  const knownSharers = [...new Set([defaultSharer, ...state.installments.filter(x => x.owner === state.profile).map(shareHolder)])];
+  const knownSharers = [...new Set([defaultSharer, ...state.installments.filter(x => x.owner === state.profile).map(shareHolder),
+    ...state.installments.map(x => (x.collect_from || '').trim()).filter(Boolean)])];
+  // "collects it from" only once migration_installment_collect_from.sql has been run.
+  const hasCollectCol = hasShareWithCol && state.installments.some(x => 'collect_from' in x);
   const counterpartLabel = escapeHtml(possessive(holderNow));
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} installment</h3>
@@ -1824,7 +1843,16 @@ function openInstallModal(item) {
     </div>
     <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">${state.profile === 'joven'
       ? "Justine's share goes into her total (paid on the 30th). Anyone else's share shows up automatically as money in on the period it's due."
-      : "Joven's share is what he covers - it comes off her Joven CC Total. Anyone else's share shows up automatically as money in on the month it's due."}</p>` : ''}
+      : "Joven's share is what Joven covers - it comes off the Joven CC Total. Anyone else's share shows up automatically as money in on the month it's due."}</p>` : ''}
+    ${hasCollectCol ? `
+    <div class="field-row" id="collect-row">
+      <div class="field"><label>${defaultSharer} collects it from <span style="text-transform:none;letter-spacing:0;">(optional)</span></label>
+        <input type="text" id="f-collect" list="sharer-list" value="${escapeHtml((i.collect_from || '').trim())}" placeholder="Leave blank if ${defaultSharer} pays it">
+      </div>
+    </div>
+    <p id="collect-help" style="font-size:12px;color:var(--text-dim);margin-top:-4px;">${state.profile === 'joven'
+      ? "If someone pays Justine back for her share (e.g. Tanie), Justine still pays you the full share, and that person's payment shows up on <b>Justine's</b> Money in."
+      : "If someone pays Joven back for his share, Joven still covers it here, and that person's payment shows up on <b>Joven's</b> Money in."}</p>` : ''}
     <div class="field-row">
       <div class="field"><label><span data-sharer-label>${counterpartLabel}</span> share of the fee</label><input type="number" step="0.01" id="f-feeshare" value="${i.wifey_fee_share}"></div>
     </div>
@@ -1923,13 +1951,22 @@ function openInstallModal(item) {
     updateItemsSummary(false);
   }
 
+  // "collects it from" only applies when the share is the other spouse's.
+  const syncCollectRow = () => {
+    if (!hasCollectCol) return;
+    const isSpouse = ($('#f-sharewith').value.trim() || defaultSharer).toLowerCase() === defaultSharer.toLowerCase();
+    $('#collect-row').style.display = isSpouse ? '' : 'none';
+    $('#collect-help').style.display = isSpouse ? '' : 'none';
+  };
   if (hasShareWithCol) {
     $('#f-sharewith').oninput = () => {
       const name = $('#f-sharewith').value.trim() || defaultSharer;
       $$('[data-sharer-label]').forEach(el => el.textContent = possessive(name));
+      syncCollectRow();
       renderItemRows();
       updateItemsSummary(true);
     };
+    syncCollectRow();
   }
   $('#modal-save').onclick = async () => {
     const payload = {
@@ -1947,6 +1984,7 @@ function openInstallModal(item) {
     if (hasShareWithCol) {
       const who = $('#f-sharewith').value.trim();
       payload.share_with = !who || who.toLowerCase() === defaultSharer.toLowerCase() ? null : who; // blank = the other spouse
+      if (hasCollectCol) payload.collect_from = payload.share_with ? null : ($('#f-collect').value.trim() || null);
     }
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
     let error, savedId = i.id;
@@ -2071,6 +2109,8 @@ function fixedForSlot(mk, type) {
         }
       } else if (share > 0 && isJovenShare(inst)) {
         r.justine -= share; // one of her plans that you cover - reduces what she owes
+        const who = collectsFrom(inst);
+        if (who) r.others.set(who, (r.others.get(who) || 0) + share); // ...but someone pays you back
       }
     });
   });
@@ -2262,6 +2302,7 @@ function computeJustineForecast(a) {
     const recPay = m ? Number(m.paycheck_budget) || 0 : 0;
     inLines.push({ label: recPay ? 'Paycheck budget' : 'Paycheck budget (assumed)', amount: recPay || Number(a.pay) || 0 });
     justineOtherShareIncomeForMonth(mk).forEach(o => inLines.push({ label: o.person, amount: o.amount, tag: 'installment share' }));
+    justinePassThroughIncomeForMonth(mk).forEach(o => inLines.push({ label: o.person, amount: o.amount, tag: "via Joven's plans" }));
     if (m) { const inc = justineIncomeForMonth(m.id).reduce((s2, x) => s2 + Number(x.amount), 0); if (inc) inLines.push({ label: 'Income lines', amount: inc }); }
     // What she owes Joven this month - from his tracker where it exists, else from shared installments.
     const jovenCc = justineOwnForSlot(mk, '15th') + justineOwnForSlot(mk, '30th');
@@ -2933,6 +2974,26 @@ function justineOtherShareIncomeForMonth(mk) {
   });
   return [...byPerson.values()].sort((a, b) => a.person.localeCompare(b.person));
 }
+// Joven's plans shared with Justine where someone else pays Justine back.
+// She still owes Joven the full share (it's in her Joven CC Total); this is
+// the money coming back to her, so it lands on her Money in.
+function justinePassThroughIncomeForMonth(mk) {
+  const byPerson = new Map();
+  state.installments.filter(i => !i.archived && isJustineShare(i) && collectsFrom(i)).forEach(inst => {
+    scheduleForInstallment(inst.id).forEach(row => {
+      if (monthKey(row.due_date) !== mk) return;
+      const share = totalWifeyShareForRow(inst, row);
+      if (share <= 0) return;
+      const who = collectsFrom(inst), key = who.toLowerCase();
+      if (!byPerson.has(key)) byPerson.set(key, { person: who, amount: 0, plans: [] });
+      const g = byPerson.get(key);
+      g.amount += share;
+      g.plans.push(`${inst.name} (Joven's plan): ${PESO(share)}`);
+    });
+  });
+  return [...byPerson.values()].sort((a, b) => a.person.localeCompare(b.person));
+}
+
 function previousJustineMonthOf(dateStr, excludeId) {
   if (!dateStr) return null;
   return state.justineMonths
@@ -2948,10 +3009,11 @@ function justineTotals(m) {
   const totalOutflow = jovenCc.total + payablesTotal;
   const extraIncome = justineIncomeForMonth(m.id).reduce((s, i) => s + Number(i.amount), 0);
   const otherShares = justineOtherShareIncomeForMonth(monthKey(m.month_date));
-  const otherShareIncome = otherShares.reduce((s, o) => s + o.amount, 0);
+  const passThrough = justinePassThroughIncomeForMonth(monthKey(m.month_date));
+  const otherShareIncome = otherShares.reduce((s, o) => s + o.amount, 0) + passThrough.reduce((s, o) => s + o.amount, 0);
   const income = Number(m.paycheck_budget) + Number(m.previous_savings || 0) + extraIncome + otherShareIncome;
   const savings = income - totalOutflow;
-  return { billsTotal, payablesTotal, totalOutflow, savings, jovenCc, generalLedger, income, extraIncome, otherShares, otherShareIncome };
+  return { billsTotal, payablesTotal, totalOutflow, savings, jovenCc, generalLedger, income, extraIncome, otherShares, passThrough, otherShareIncome };
 }
 
 function renderJustineSummary() {
@@ -3014,6 +3076,8 @@ function renderJustineSummary() {
         <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(m.previous_savings || 0)}</span></div>
         ${t.otherShares.map(o => `
           <div class="line"><span class="lbl">${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span></span><span class="val">${PESO(o.amount)}</span></div>`).join('')}
+        ${t.passThrough.map(o => `
+          <div class="line"><span class="lbl">${escapeHtml(o.person)} <span class="synced-badge" style="color:var(--purple);background:rgba(167,139,250,.14);" title="Pays Justine back for her share of: ${escapeHtml(o.plans.join(', '))}. She still pays Joven the full share - it's in the Joven CC Total below.">⇄ via Joven's plans</span></span><span class="val">${PESO(o.amount)}</span></div>`).join('')}
         ${justineIncomeForMonth(m.id).map(item => `
           <div class="line">
             <span class="lbl">${escapeHtml(item.label)}
