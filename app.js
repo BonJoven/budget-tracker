@@ -1813,12 +1813,16 @@ function openInstallModal(item) {
   // migration_installment_share_with.sql has been run.
   const hasShareWithCol = state.installments.some(x => 'share_with' in x);
   const defaultSharer = defaultSharerFor(state.profile);
-  const holderNow = shareHolder({ ...i, owner: i.owner || state.profile });
+  // No pre-filled name: a new plan starts with "Shared with" empty. An existing
+  // plan shows who it's shared with - its saved name, or the other spouse for
+  // older plans that have a share but were saved before names were stored.
+  const hasAnyShare = Number(i.wifey_monthly_share || 0) > 0 || Number(i.wifey_fee_share || 0) > 0;
+  const holderNow = (i.share_with || '').trim() || (isEdit && hasAnyShare ? defaultSharerFor(i.owner || state.profile) : '');
   const knownSharers = [...new Set([defaultSharer, ...state.installments.filter(x => x.owner === state.profile).map(shareHolder),
     ...state.installments.map(x => (x.collect_from || '').trim()).filter(Boolean)])];
   // "collects it from" only once migration_installment_collect_from.sql has been run.
   const hasCollectCol = hasShareWithCol && state.installments.some(x => 'collect_from' in x);
-  const counterpartLabel = escapeHtml(possessive(holderNow));
+  const counterpartLabel = escapeHtml(possessive(holderNow || defaultSharerFor(state.profile)));
   showModal(`
     <h3>${isEdit ? 'Edit' : 'New'} installment</h3>
     <div class="field-row">
@@ -1837,7 +1841,7 @@ function openInstallModal(item) {
     ${hasShareWithCol ? `
     <div class="field-row">
       <div class="field"><label>Shared with</label>
-        <input type="text" id="f-sharewith" list="sharer-list" value="${escapeHtml(holderNow)}" placeholder="${defaultSharer}">
+        <input type="text" id="f-sharewith" list="sharer-list" value="${escapeHtml(holderNow)}" placeholder="Leave blank if it's all yours">
         <datalist id="sharer-list">${knownSharers.map(n => `<option value="${escapeHtml(n)}">`).join('')}</datalist>
       </div>
     </div>
@@ -1860,7 +1864,7 @@ function openInstallModal(item) {
     <div class="field-row">
       <div class="field"><label>Monthly amount</label><input type="number" step="0.01" id="f-monthly" value="${i.monthly_amount}"></div>
       <div class="field"><label># of months</label><input type="number" id="f-months" value="${i.num_months}"></div>
-      <div class="field"><label><span data-sharer-label>${counterpartLabel}</span> share (per month)</label><input type="number" step="0.01" id="f-monthlyshare" value="${i.wifey_monthly_share}"></div>
+      <div class="field" id="monthlyshare-field"><label><span data-sharer-label>${counterpartLabel}</span> share (per month)</label><input type="number" step="0.01" id="f-monthlyshare" value="${i.wifey_monthly_share}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Start date</label><input type="date" id="f-start" value="${i.start_date}"></div>
@@ -1885,11 +1889,16 @@ function openInstallModal(item) {
   // sits there), with a one-click fix when a monthly share was typed into it.
   // The fee share is added to the FIRST payment only, so on a ₱0 fee it's
   // almost always a mistake. ----
+  const sharerNow = () => hasShareWithCol ? $('#f-sharewith').value.trim() : (holderNow || defaultSharer);
   const syncFeeShare = () => {
     const fee = +$('#f-fee').value || 0, fs = +$('#f-feeshare').value || 0;
-    $('#feeshare-row').style.display = fee > 0 || fs > 0 ? '' : 'none';
+    const shared = !!sharerNow();
+    $('#feeshare-row').style.display = shared && (fee > 0 || fs > 0) ? '' : 'none';
+    $('#monthlyshare-field').style.display = shared ? '' : 'none';
     const w = $('#feeshare-warn');
-    if (fee === 0 && fs > 0) {
+    if (!shared) {
+      w.style.display = 'none';
+    } else if (fee === 0 && fs > 0) {
       w.innerHTML = `⚠ The fee is ₱0, so this ${PESO(fs)} only gets added to the <b>first payment</b>. Meant to be the monthly share? <button type="button" class="fc-use" id="move-feeshare">Move it to per month</button>`;
       w.style.display = '';
       $('#move-feeshare').onclick = () => { $('#f-monthlyshare').value = fs; $('#f-feeshare').value = 0; syncFeeShare(); };
@@ -1907,7 +1916,7 @@ function openInstallModal(item) {
   // ---- Breakdown: items, each with an owner. The shared person's slice of
   // the item total sets their monthly + fee share automatically. ----
   const selfName = state.profile === 'joven' ? 'Joven' : 'Justine';
-  const currentSharer = () => hasShareWithCol ? ($('#f-sharewith').value.trim() || defaultSharer) : holderNow;
+  const currentSharer = sharerNow;
   let items = state.itemsTableOk && isEdit ? itemsForInstallment(i.id).map(x => ({ label: x.label, owner: x.owner, amount: x.amount })) : [];
   const renderItemRows = () => {
     if (!state.itemsTableOk) return;
@@ -1940,13 +1949,13 @@ function openInstallModal(item) {
       if (!byOwner.has(key)) byOwner.set(key, { name, amount: 0 });
       byOwner.get(key).amount += Number(it.amount);
     });
-    const sharerAmt = (byOwner.get(sharer.toLowerCase()) || { amount: 0 }).amount;
+    const sharerAmt = sharer ? (byOwner.get(sharer.toLowerCase()) || { amount: 0 }).amount : 0;
     const ratio = total > 0 ? sharerAmt / total : 0;
     const monthly = +$('#f-monthly').value || 0;
     const fee = +$('#f-fee').value || 0;
     const shareMonthly = round2(monthly * ratio);
     const shareFee = round2(fee * ratio);
-    if (applyShares) {
+    if (applyShares && sharer) {
       $('#f-monthlyshare').value = shareMonthly;
       $('#f-feeshare').value = shareFee;
       syncFeeShare();
@@ -1960,8 +1969,8 @@ function openInstallModal(item) {
         ${principal ? (Math.abs(diff) < 0.01 ? `<span class="ok">✓ matches principal</span>` : `<span class="warn">${PESO(Math.abs(diff))} ${diff < 0 ? 'short of' : 'over'} principal</span>`) : ''}
       </div>
       <div class="items-owners">${[...byOwner.values()].map(o => `<span>${escapeHtml(o.name)} <b>${PESO(o.amount)}</b> (${(o.amount / total * 100).toFixed(1)}%)</span>`).join('')}</div>
-      <div class="items-share">→ ${escapeHtml(possessive(sharer))} share: <b>${PESO(shareMonthly)}/mo</b>${fee ? ` + <b>${PESO(shareFee)}</b> of the fee` : ''} <span>(filled in above — you can still type over it)</span></div>
-      ${strangers.length ? `<div class="warn" style="margin-top:6px;">Only ${escapeHtml(sharer)}'s items count toward the share — ${strangers.map(o => escapeHtml(o.name)).join(', ')} ${strangers.length === 1 ? "isn't" : "aren't"} this plan's "Shared with".</div>` : ''}`;
+      ${sharer ? `<div class="items-share">→ ${escapeHtml(possessive(sharer))} share: <b>${PESO(shareMonthly)}/mo</b>${fee ? ` + <b>${PESO(shareFee)}</b> of the fee` : ''} <span>(filled in above — you can still type over it)</span></div>` : ''}
+      ${strangers.length ? `<div class="warn" style="margin-top:6px;">${sharer ? `Only ${escapeHtml(sharer)}'s items count toward the share — ` : 'Nobody is in "Shared with", so this plan is all yours — '}${strangers.map(o => escapeHtml(o.name)).join(', ')} ${strangers.length === 1 ? "isn't" : "aren't"} this plan's "Shared with".</div>` : ''}`;
   };
   if (state.itemsTableOk) {
     $('#add-item-btn').onclick = () => {
@@ -1979,14 +1988,15 @@ function openInstallModal(item) {
   // "collects it from" only applies when the share is the other spouse's.
   const syncCollectRow = () => {
     if (!hasCollectCol) return;
-    const isSpouse = ($('#f-sharewith').value.trim() || defaultSharer).toLowerCase() === defaultSharer.toLowerCase();
+    const isSpouse = $('#f-sharewith').value.trim().toLowerCase() === defaultSharer.toLowerCase();
     $('#collect-row').style.display = isSpouse ? '' : 'none';
     $('#collect-help').style.display = isSpouse ? '' : 'none';
   };
   if (hasShareWithCol) {
     $('#f-sharewith').oninput = () => {
-      const name = $('#f-sharewith').value.trim() || defaultSharer;
-      $$('[data-sharer-label]').forEach(el => el.textContent = possessive(name));
+      const name = $('#f-sharewith').value.trim();
+      if (name) $$('[data-sharer-label]').forEach(el => el.textContent = possessive(name));
+      syncFeeShare();
       syncCollectRow();
       renderItemRows();
       updateItemsSummary(true);
@@ -2008,11 +2018,12 @@ function openInstallModal(item) {
     };
     if (hasShareWithCol) {
       const who = $('#f-sharewith').value.trim();
-      payload.share_with = !who || who.toLowerCase() === defaultSharer.toLowerCase() ? null : who; // blank = the other spouse
-      if (hasCollectCol) payload.collect_from = payload.share_with ? null : ($('#f-collect').value.trim() || null);
+      payload.share_with = who || null;
+      if (!who) { payload.wifey_monthly_share = 0; payload.wifey_fee_share = 0; } // not shared = all yours
+      if (hasCollectCol) payload.collect_from = who && who.toLowerCase() === defaultSharer.toLowerCase() ? ($('#f-collect').value.trim() || null) : null;
     }
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
-    const who2 = possessive(currentSharer());
+    const who2 = currentSharer() ? possessive(currentSharer()) : 'The';
     if (payload.monthly_amount > 0 && payload.wifey_monthly_share > payload.monthly_amount) { toast(`${who2} share per month can't be more than the monthly amount`, { error: true }); return; }
     if (payload.fee > 0 && payload.wifey_fee_share > payload.fee) { toast(`${who2} share of the fee can't be more than the fee`, { error: true }); return; }
     if (payload.fee === 0 && payload.wifey_fee_share > 0 &&
