@@ -543,10 +543,12 @@ function toLocalISODate(d) {
 
 function generateScheduleRows(inst) {
   const rows = [];
-  const start = new Date(inst.start_date + 'T00:00:00');
+  const [sy, sm, sd] = inst.start_date.split('-').map(Number);
   for (let i = 0; i < inst.num_months; i++) {
-    const d = new Date(start);
-    d.setMonth(d.getMonth() + i);
+    // Same day each month, clamped to the month's last day - a plan due on the
+    // 30th falls on Feb 28, not March 2 (which setMonth() would roll over to).
+    const lastDay = new Date(sy, sm - 1 + i + 1, 0).getDate();
+    const d = new Date(sy, sm - 1 + i, Math.min(sd, lastDay));
     rows.push({
       due_date: toLocalISODate(d),
       amount: Number(inst.monthly_amount),          // base amount only - fee is added on top at display time
@@ -2085,7 +2087,7 @@ function forecastAssumptions() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(FORECAST_KEY) || '{}'); } catch (e) { saved = {}; }
   return {
-    sal15: latestSalary('15th'), sal30: latestSalary('30th'), other15: 0, other30: 0, startCash: 0,
+    sal15: latestSalary('15th'), sal30: latestSalary('30th'), inc15: 0, inc30: 0, other15: 0, other30: 0, startCash: 0,
     wiOn: false, wiAmount: 0, wiMonths: 6, wiRate: 1, wiFirst: '', wiTakeoff: '',
     ...saved,
   };
@@ -2185,12 +2187,14 @@ function computeForecast(a) {
       inLines.push({ label: recSalary ? 'Salary' : 'Salary (assumed)', amount: recSalary || assumedSalary });
       t.otherShares.forEach(o => inLines.push({ label: o.person, amount: o.amount, tag: 'installment share' }));
       if (t.extraIncome) inLines.push({ label: 'Income lines', amount: t.extraIncome });
+      else if (type === '15th' ? a.inc15 : a.inc30) inLines.push({ label: 'Other income', amount: Number(type === '15th' ? a.inc15 : a.inc30), tag: 'assumption' });
       state.cards.forEach(c => { const v = cardTotalForPeriod(c.id, existing.id); if (v) outLines.push({ label: c.name, amount: v, color: c.color }); });
       const gl = generalLedgerInstallmentTotalForPeriod(existing.id);
       if (gl) outLines.push({ label: 'General ledger', amount: gl });
     } else {
       const f = fixedForSlot(mk, type);
       inLines.push({ label: 'Salary (assumed)', amount: assumedSalary });
+      if (type === '15th' ? a.inc15 : a.inc30) inLines.push({ label: 'Other income', amount: Number(type === '15th' ? a.inc15 : a.inc30), tag: 'assumption' });
       [...f.others.entries()].forEach(([who, v]) => inLines.push({ label: who, amount: v, tag: 'installment share' }));
       [...f.byCard.entries()].forEach(([ck, v]) => {
         const c = state.cards.find(x => x.id === ck);
@@ -2283,7 +2287,7 @@ function justineForecastAssumptions() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(JFORECAST_KEY) || '{}'); } catch (e) { saved = {}; }
   return {
-    pay: latest ? Number(latest.paycheck_budget) || 0 : 0,
+    pay: latest ? Number(latest.paycheck_budget) || 0 : 0, inc: 0,
     bills: latest ? round2(justineBillsForMonth(latest.id).reduce((s2, b) => s2 + Number(b.amount), 0)) : 0,
     other: 0, startCash: 0,
     wiOn: false, wiAmount: 0, wiMonths: 6, wiRate: 1, wiFirst: '', wiTakeoff: '',
@@ -2344,7 +2348,9 @@ function computeJustineForecast(a) {
     inLines.push({ label: recPay ? 'Paycheck budget' : 'Paycheck budget (assumed)', amount: recPay || Number(a.pay) || 0 });
     justineOtherShareIncomeForMonth(mk).forEach(o => inLines.push({ label: o.person, amount: o.amount, tag: 'installment share' }));
     justinePassThroughIncomeForMonth(mk).forEach(o => inLines.push({ label: o.person, amount: o.amount, tag: "via Joven's plans" }));
-    if (m) { const inc = justineIncomeForMonth(m.id).reduce((s2, x) => s2 + Number(x.amount), 0); if (inc) inLines.push({ label: 'Income lines', amount: inc }); }
+    const recInc = m ? justineIncomeForMonth(m.id).reduce((s2, x) => s2 + Number(x.amount), 0) : 0;
+    if (recInc) inLines.push({ label: 'Income lines', amount: recInc });
+    else if (Number(a.inc)) inLines.push({ label: 'Other income', amount: Number(a.inc), tag: 'assumption' });
     // What she owes Joven this month - from his tracker where it exists, else from shared installments.
     const jovenCc = justineOwnForSlot(mk, '15th') + justineOwnForSlot(mk, '30th');
     if (jovenCc) outLines.push({ label: 'Joven CC total', amount: jovenCc, tag: 'from his tracker' });
@@ -2391,6 +2397,12 @@ function renderJustineForecast() {
   const opts = (sel, withNone) => (withNone ? `<option value="" ${!sel ? 'selected' : ''}>— nothing (it's a new purchase)</option>` : '') +
     slots.map(x => `<option value="${x.key}" ${x.key === sel ? 'selected' : ''}>${monthLabelShort(x.mk)}</option>`).join('');
   const avg = averageJustineCardSpending();
+  const jIncHint = () => {
+    const mm = state.justineMonths.filter(x => !x.archived && justineIncomeForMonth(x.id).length).sort((x, y) => y.month_date.localeCompare(x.month_date))[0];
+    if (!mm) return 'bonus, side gig… if they repeat';
+    const v = round2(justineIncomeForMonth(mm.id).reduce((s2, x) => s2 + Number(x.amount), 0));
+    return `income lines · <button type="button" class="fc-use" id="fj-inc-use" data-v="${v}">use ${monthLabelShort(monthKey(mm.month_date))}'s ${PESO(v)}</button>`;
+  };
   const num = (id, label, val, hint) => `<div class="field"><label>${label}</label><input type="number" step="0.01" id="${id}" value="${val}">${hint ? `<div class="fc-hint">${hint}</div>` : ''}</div>`;
   main.innerHTML = `
     <h2>Forecast</h2>
@@ -2400,6 +2412,7 @@ function renderJustineForecast() {
       <div class="sh"><h3>Assumptions</h3></div>
       <div class="fc-grid-inputs">
         ${num('fj-pay', 'Paycheck budget / month', a.pay)}
+        ${num('fj-inc', 'Other income / month', a.inc, jIncHint())}
         ${num('fj-bills', 'Monthly bills', a.bills, 'from her latest month (Papa, PLDT…)')}
         ${num('fj-other', 'Other spending / month', a.other, avg ? `card buys beyond installments · <button type="button" class="fc-use" id="fj-use" data-v="${avg.avg}">use her avg ${PESO(avg.avg)}</button>` : 'card buys beyond installments, cash…')}
         ${num('fj-start', 'Starting cash', a.startCash, 'what she has on hand today')}
@@ -2423,7 +2436,7 @@ function renderJustineForecast() {
   const read = () => {
     const v = id => +$(id).value || 0;
     Object.assign(a, {
-      pay: v('#fj-pay'), bills: v('#fj-bills'), other: v('#fj-other'), startCash: v('#fj-start'),
+      pay: v('#fj-pay'), inc: v('#fj-inc'), bills: v('#fj-bills'), other: v('#fj-other'), startCash: v('#fj-start'),
       wiOn: $('#fc-wi-on').checked, wiAmount: v('#fc-wi-amount'), wiMonths: Math.max(1, Math.round(v('#fc-wi-months')) || 1),
       wiRate: v('#fc-wi-rate'), wiFirst: $('#fc-wi-first').value, wiTakeoff: $('#fc-wi-takeoff').value,
     });
@@ -2432,6 +2445,7 @@ function renderJustineForecast() {
     renderForecastResults(a);
   };
   if ($('#fj-use')) $('#fj-use').onclick = () => { $('#fj-other').value = $('#fj-use').dataset.v; read(); };
+  if ($('#fj-inc-use')) $('#fj-inc-use').onclick = () => { $('#fj-inc').value = $('#fj-inc-use').dataset.v; read(); };
   $$('#main .fc-grid-inputs input, #main .fc-grid-inputs select, #fc-wi-on').forEach(el => el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', read));
   renderForecastResults(a);
 }
@@ -2444,6 +2458,14 @@ function renderForecast() {
   if (!a.wiFirst || !slots.some(x => x.key === a.wiFirst)) a.wiFirst = (slots.find(x => x.type === '30th') || slots[0]).key;
   const slotOptions = (sel, withNone) => (withNone ? `<option value="" ${!sel ? 'selected' : ''}>— nothing (it's a new purchase)</option>` : '') +
     slots.map(x => `<option value="${x.key}" ${x.key === sel ? 'selected' : ''}>${slotLabel(x.mk, x.type)}, ${x.mk.slice(0, 4)}</option>`).join('');
+  // Income lines (Part Time, JP...) from the latest period of each type that has any.
+  const incHint = type => {
+    const p = state.periods.filter(x => !x.archived && x.period_type === type && incomeItemsForPeriod(x.id).length)
+      .sort((x, y) => y.period_date.localeCompare(x.period_date))[0];
+    if (!p) return 'Part Time, JP… if they repeat';
+    const v = round2(incomeItemsForPeriod(p.id).reduce((s2, x) => s2 + Number(x.amount), 0));
+    return `Part Time, JP… · <button type="button" class="fc-use" data-fc-inc="${type}" data-v="${v}">use ${shortDate(p.period_date)}'s ${PESO(v)}</button>`;
+  };
   const avgHint = type => {
     const r = averageRecordedSpending(type);
     return r ? `new card buys, cash, bills · <button type="button" class="fc-use" data-fc-use="${type}" data-v="${r.avg}">use your avg ${PESO(r.avg)}</button>` : 'new card buys, cash, bills not in the tracker';
@@ -2458,6 +2480,8 @@ function renderForecast() {
       <div class="fc-grid-inputs">
         ${num('fc-sal15', '15th salary', a.sal15)}
         ${num('fc-sal30', '30th salary', a.sal30)}
+        ${num('fc-inc15', 'Other income · 15th', a.inc15, incHint('15th'))}
+        ${num('fc-inc30', 'Other income · 30th', a.inc30, incHint('30th'))}
         ${num('fc-other15', 'Other spending · 15th', a.other15, avgHint('15th'))}
         ${num('fc-other30', 'Other spending · 30th', a.other30, avgHint('30th'))}
         ${num('fc-start', 'Starting cash', a.startCash, 'what you have on hand today')}
@@ -2482,7 +2506,7 @@ function renderForecast() {
   const read = () => {
     const v = id => +$(id).value || 0;
     Object.assign(a, {
-      sal15: v('#fc-sal15'), sal30: v('#fc-sal30'), other15: v('#fc-other15'), other30: v('#fc-other30'), startCash: v('#fc-start'),
+      sal15: v('#fc-sal15'), sal30: v('#fc-sal30'), inc15: v('#fc-inc15'), inc30: v('#fc-inc30'), other15: v('#fc-other15'), other30: v('#fc-other30'), startCash: v('#fc-start'),
       wiOn: $('#fc-wi-on').checked, wiAmount: v('#fc-wi-amount'), wiMonths: Math.max(1, Math.round(v('#fc-wi-months')) || 1),
       wiRate: v('#fc-wi-rate'), wiFirst: $('#fc-wi-first').value, wiTakeoff: $('#fc-wi-takeoff').value,
     });
@@ -2490,6 +2514,10 @@ function renderForecast() {
     $('.fc-whatif').classList.toggle('on', a.wiOn);
     renderForecastResults(a);
   };
+  $$('[data-fc-inc]').forEach(b => b.onclick = () => {
+    $(b.dataset.fcInc === '15th' ? '#fc-inc15' : '#fc-inc30').value = b.dataset.v;
+    read();
+  });
   $$('[data-fc-use]').forEach(b => b.onclick = () => {
     const inp = $(b.dataset.fcUse === '15th' ? '#fc-other15' : '#fc-other30');
     inp.value = b.dataset.v;
