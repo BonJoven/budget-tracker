@@ -1852,10 +1852,11 @@ function openInstallModal(item) {
     </div>
     <p id="collect-help" style="font-size:12px;color:var(--text-dim);margin-top:-4px;">${state.profile === 'joven'
       ? "If someone pays Justine back for her share (e.g. Tanie), Justine still pays you the full share, and that person's payment shows up on <b>Justine's</b> Money in."
-      : "If someone pays Joven back for his share, Joven still covers it here, and that person's payment shows up on <b>Joven's</b> Money in."}</p>` : ''}
-    <div class="field-row">
+      : "If someone pays Joven back for Joven's share, Joven still covers it here, and that person's payment shows up on <b>Joven's</b> Money in."}</p>` : ''}
+    <div class="field-row" id="feeshare-row">
       <div class="field"><label><span data-sharer-label>${counterpartLabel}</span> share of the fee</label><input type="number" step="0.01" id="f-feeshare" value="${i.wifey_fee_share}"></div>
     </div>
+    <div id="feeshare-warn" class="feeshare-warn" style="display:none;"></div>
     <div class="field-row">
       <div class="field"><label>Monthly amount</label><input type="number" step="0.01" id="f-monthly" value="${i.monthly_amount}"></div>
       <div class="field"><label># of months</label><input type="number" id="f-months" value="${i.num_months}"></div>
@@ -1879,6 +1880,29 @@ function openInstallModal(item) {
       <button class="btn" id="modal-save">Save</button>
     </div>
   `);
+
+  // ---- Share of the fee: only shown when there's a fee (or a value already
+  // sits there), with a one-click fix when a monthly share was typed into it.
+  // The fee share is added to the FIRST payment only, so on a ₱0 fee it's
+  // almost always a mistake. ----
+  const syncFeeShare = () => {
+    const fee = +$('#f-fee').value || 0, fs = +$('#f-feeshare').value || 0;
+    $('#feeshare-row').style.display = fee > 0 || fs > 0 ? '' : 'none';
+    const w = $('#feeshare-warn');
+    if (fee === 0 && fs > 0) {
+      w.innerHTML = `⚠ The fee is ₱0, so this ${PESO(fs)} only gets added to the <b>first payment</b>. Meant to be the monthly share? <button type="button" class="fc-use" id="move-feeshare">Move it to per month</button>`;
+      w.style.display = '';
+      $('#move-feeshare').onclick = () => { $('#f-monthlyshare').value = fs; $('#f-feeshare').value = 0; syncFeeShare(); };
+    } else if (fee > 0 && fs > fee) {
+      w.textContent = `⚠ Can't be more than the fee itself (${PESO(fee)}).`;
+      w.style.display = '';
+    } else {
+      w.style.display = 'none';
+    }
+  };
+  $('#f-fee').addEventListener('input', syncFeeShare);
+  $('#f-feeshare').addEventListener('input', syncFeeShare);
+  syncFeeShare();
 
   // ---- Breakdown: items, each with an owner. The shared person's slice of
   // the item total sets their monthly + fee share automatically. ----
@@ -1925,6 +1949,7 @@ function openInstallModal(item) {
     if (applyShares) {
       $('#f-monthlyshare').value = shareMonthly;
       $('#f-feeshare').value = shareFee;
+      syncFeeShare();
     }
     const principal = +$('#f-principal').value || 0;
     const diff = round2(total - principal);
@@ -1987,6 +2012,11 @@ function openInstallModal(item) {
       if (hasCollectCol) payload.collect_from = payload.share_with ? null : ($('#f-collect').value.trim() || null);
     }
     if (!payload.name || !payload.start_date) { toast('Fill in name and start date'); return; }
+    const who2 = possessive(currentSharer());
+    if (payload.monthly_amount > 0 && payload.wifey_monthly_share > payload.monthly_amount) { toast(`${who2} share per month can't be more than the monthly amount`, { error: true }); return; }
+    if (payload.fee > 0 && payload.wifey_fee_share > payload.fee) { toast(`${who2} share of the fee can't be more than the fee`, { error: true }); return; }
+    if (payload.fee === 0 && payload.wifey_fee_share > 0 &&
+        !confirm(`The fee is ₱0, so ${who2} share of the fee (${PESO(payload.wifey_fee_share)}) will only be added to the first payment, not every month.\n\nSave anyway?`)) return;
     let error, savedId = i.id;
     const scheduleAffectingFieldsChanged = isEdit && (
       Number(payload.monthly_amount) !== Number(i.monthly_amount) ||
