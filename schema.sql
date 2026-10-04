@@ -69,7 +69,8 @@ create table installments (
   owner text not null default 'joven',       -- 'joven' or 'justine' - whose tracker this belongs to
   wifey_monthly_share numeric not null default 0,  -- portion of EACH monthly payment that's the other spouse's
   wifey_fee_share numeric not null default 0,      -- portion of the fee (1st payment only) that's the other spouse's
-  share_with text,               -- who the shared part belongs to on Joven's plans (blank = Justine)
+  share_with text,               -- who the shared part belongs to (blank = the other spouse)
+  collect_from text,             -- when the spouse's share is paid back to them by someone else
   billed_to_card_id uuid references credit_cards(id),  -- unused (kept for backward compatibility)
   notes text,
   archived boolean not null default false
@@ -106,7 +107,7 @@ create table justine_months (
   id uuid primary key default gen_random_uuid(),
   month_date date not null unique,       -- always the 1st of the month, e.g. 2026-08-01
   paycheck_budget numeric not null default 0,
-  previous_savings numeric not null default 0,  -- unused (kept for backward compatibility)
+  previous_savings numeric not null default 0,  -- carried over from the month before (like Joven's periods)
   joven_cc_total numeric not null default 0,    -- unused (kept for backward compatibility, now auto-synced from Joven's periods)
   bpi_total numeric not null default 0,
   eastwest_total numeric not null default 0,
@@ -116,6 +117,14 @@ create table justine_months (
 
 -- Her flexible list of fixed monthly bills (Papa, Cat Food, PLDT, St. Peter, Transpo, etc.)
 create table justine_bills (
+  id uuid primary key default gen_random_uuid(),
+  month_id uuid not null references justine_months(id) on delete cascade,
+  label text not null,
+  amount numeric not null default 0
+);
+
+-- Her extra income lines per month (bonus, side gig...), like Joven's income_items
+create table justine_income_items (
   id uuid primary key default gen_random_uuid(),
   month_id uuid not null references justine_months(id) on delete cascade,
   label text not null,
@@ -160,6 +169,7 @@ alter table installments enable row level security;
 alter table app_settings enable row level security;
 alter table justine_months enable row level security;
 alter table justine_bills enable row level security;
+alter table justine_income_items enable row level security;
 alter table installment_schedule enable row level security;
 alter table wifey_adjustments enable row level security;
 alter table installment_items enable row level security;
@@ -172,6 +182,7 @@ create policy "allow all - installments" on installments for all using (true) wi
 create policy "allow all - app_settings" on app_settings for all using (true) with check (true);
 create policy "allow all - justine_months" on justine_months for all using (true) with check (true);
 create policy "allow all - justine_bills" on justine_bills for all using (true) with check (true);
+create policy "allow all - justine_income_items" on justine_income_items for all using (true) with check (true);
 create policy "allow all - wifey_adjustments" on wifey_adjustments for all using (true) with check (true);
 create policy "allow all - installment_schedule" on installment_schedule for all using (true) with check (true);
 create policy "allow all - installment_items" on installment_items for all using (true) with check (true);
