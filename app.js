@@ -136,6 +136,58 @@ function dbOk(res, okMsg) {
   return true;
 }
 
+// Archive / restore several rows at once (a whole month = its 15th + 30th).
+async function setArchivedMany(table, ids, archived, label) {
+  const results = await Promise.all(ids.map(id => db.from(table).update({ archived }).eq('id', id)));
+  const bad = results.find(r => r.error);
+  await loadAll(); renderView();
+  if (bad) { dbOk(bad); return; }
+  if (archived) toast(`${label} archived`, { undo: () => setArchivedMany(table, ids, false, label) });
+  else toast(`${label} restored`);
+}
+
+// ---- Received / Paid ticks on Summary lines ----
+// scope 'period' = one of Joven's pay periods, 'jmonth' = one of Justine's months.
+function lineDone(scope, ref, key) {
+  return (state.lineStatus || []).some(x => x.scope === scope && x.ref_id === ref && x.line_key === key && x.done);
+}
+async function toggleLineStatus(scope, ref, key, done) {
+  let row = state.lineStatus.find(x => x.scope === scope && x.ref_id === ref && x.line_key === key);
+  if (row) row.done = done; else state.lineStatus.push(row = { scope, ref_id: ref, line_key: key, done });
+  renderView(); // instant; the save happens in the background
+  const res = await db.from('line_status').upsert({ scope, ref_id: ref, line_key: key, done, updated_at: new Date().toISOString() }, { onConflict: 'scope,ref_id,line_key' });
+  if (!dbOk(res)) { row.done = !done; renderView(); }
+}
+// One Money in / Money out line, with a tick box when it's something that
+// actually arrives or gets paid. `acc` collects amounts for the section header.
+function flowLine(acc, { scope, ref, key, kind, label, amount, valHtml, valStyle, secret }) {
+  const tickable = state.lineStatusOk && !!key && Number(amount) !== 0;
+  const done = tickable && lineDone(scope, ref, key);
+  if (tickable) acc.push({ amount: Number(amount), done, secret: !!secret });
+  const word = kind === 'in' ? 'received' : 'paid';
+  const box = tickable
+    ? `<input type="checkbox" class="line-chk" data-ls="${scope}|${ref}|${key}" ${done ? 'checked' : ''} title="Mark as ${word}" aria-label="${word}">`
+    : (state.lineStatusOk ? '<span class="line-chk-pad"></span>' : '');
+  return `<div class="line${done ? ' is-done' : ''}"><span class="lbl">${box}${label}</span><span class="val"${valStyle ? ` style="${valStyle}"` : ''}>${valHtml ?? PESO(amount)}</span></div>`;
+}
+function flowProgress(acc, kind) {
+  if (!state.lineStatusOk || !acc.length) return '';
+  const word = kind === 'in' ? 'received' : 'paid';
+  const doneN = acc.filter(x => x.done).length;
+  if (doneN === acc.length) return `<span class="flow-prog all">✓ all ${word}</span>`;
+  const pending = acc.filter(x => !x.done);
+  const left = pending.reduce((sum, x) => sum + x.amount, 0);
+  // Don't leak a hidden salary through the "still to come in" figure.
+  const leftTxt = pending.some(x => x.secret) && !state.revealSalary ? '₱••••••' : PESO(left);
+  return `<span class="flow-prog">${doneN}/${acc.length} ${word} · ${leftTxt} ${kind === 'in' ? 'to come in' : 'left to pay'}</span>`;
+}
+function wireLineTicks() {
+  $$('.line-chk').forEach(cb => cb.onchange = () => {
+    const [scope, ref, ...rest] = cb.dataset.ls.split('|');
+    toggleLineStatus(scope, ref, rest.join('|'), cb.checked);
+  });
+}
+
 // Archive / restore with an Undo on the toast, instead of a confirm dialog.
 async function setArchived(table, id, archived, label) {
   if (!dbOk(await db.from(table).update({ archived }).eq('id', id))) return;
@@ -277,7 +329,7 @@ async function enterApp() {
 }
 
 async function loadAll() {
-  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments, visionBoards, visionBoardChecklist, visionBoardImages, installmentItems, justineIncome] = await Promise.all([
+  const [cards, periods, transactions, installments, incomeItems, justineMonths, justineBills, schedule, wifeyAdjustments, visionBoards, visionBoardChecklist, visionBoardImages, installmentItems, justineIncome, lineStatus] = await Promise.all([
     db.from('credit_cards').select('*').order('sort_order'),
     db.from('periods').select('*').order('period_date', { ascending: true }),
     db.from('transactions').select('*'),
@@ -292,6 +344,7 @@ async function loadAll() {
     db.from('vision_board_images').select('*').order('sort_order'),
     db.from('installment_items').select('*').order('sort_order'),
     db.from('justine_income_items').select('*'),
+    db.from('line_status').select('*'),
   ]);
   state.cards = cards.data || [];
   state.periods = periods.data || [];
@@ -311,6 +364,9 @@ async function loadAll() {
   // Justine's income lines switch on once migration_justine_income.sql has been run.
   state.justineIncomeOk = !justineIncome.error;
   state.justineIncomeItems = justineIncome.data || [];
+  // Received / Paid ticks switch on once migration_line_status.sql has been run.
+  state.lineStatusOk = !lineStatus.error;
+  state.lineStatus = lineStatus.data || [];
 }
 
 /* ---------------- SIDEBAR / NAV ---------------- */
@@ -695,52 +751,62 @@ function renderSummary() {
 
   function periodBoxHtml(p, pairForMonth) {
     const t = periodTotals(p);
-    let combinedJustineLine = '';
-    if (p.period_type === '30th') {
-      combinedJustineLine = `<div class="line"><span class="lbl">Justine total (15th + 30th) <span class="synced-badge" style="color:var(--green);background:rgba(79,216,151,.14);" title="She pays you in one lump sum on the 30th, so this combined amount is what's added to this period's savings">✓ counted in savings</span></span><span class="val">${PESO(t.wifeyCounted)}</span></div>`;
-    }
+    const sc = 'period', ref = p.id;
+    const inAcc = [], outAcc = [];
+    const is30 = p.period_type === '30th';
+    const inLines = [
+      flowLine(inAcc, { scope: sc, ref, key: 'salary', kind: 'in', label: '💰 Salary', amount: Number(p.salary), secret: true,
+        valHtml: `${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button>` }),
+      flowLine(inAcc, { label: 'Previous savings', amount: Number(p.previous_savings) }),
+      flowLine(inAcc, { label: `Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span>${!is30 ? `<span class="synced-badge" style="color:var(--text-dim);background:rgba(141,149,171,.14);" title="She pays on the 30th, so this is shown for reference only - it's added to the 30th's savings instead">not counted · paid on 30th</span>` : ''}`,
+        amount: t.wifeyAmount, valStyle: !is30 ? 'color:var(--text-dim);font-weight:400;' : '' }),
+      is30 ? flowLine(inAcc, { scope: sc, ref, key: 'justine_total', kind: 'in', amount: t.wifeyCounted,
+        label: `Justine total (15th + 30th) <span class="synced-badge" style="color:var(--green);background:rgba(79,216,151,.14);" title="She pays you in one lump sum on the 30th, so this combined amount is what's added to this period's savings">✓ counted in savings</span>` }) : '',
+      ...t.otherShares.map(o => flowLine(inAcc, { scope: sc, ref, key: 'share:' + o.person.toLowerCase(), kind: 'in', amount: o.amount,
+        label: `${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span>` })),
+      ...incomeItemsForPeriod(p.id).map(item => flowLine(inAcc, { scope: sc, ref, key: 'income:' + item.id, kind: 'in', amount: Number(item.amount),
+        label: `${escapeHtml(item.label)}
+                <button class="icon-btn edit" data-edit-income="${item.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
+                <button class="icon-btn" data-del-income="${item.id}" title="Delete" aria-label="Delete">✕</button>` })),
+    ].join('');
+    const gl = generalLedgerInstallmentTotalForPeriod(p.id);
+    const outLines = [
+      flowLine(outAcc, { scope: sc, ref, key: 'gl', kind: 'out', amount: gl,
+        label: `General ledger <span class="synced-badge" title="Only counts general-ledger installments that add to your outflow - balance adjustments with Justine don't count here, see the Justine line for those">outflow only</span>` }),
+      ...state.cards.map(c => {
+        const amt = cardTotalForPeriod(c.id, p.id);
+        if (!amt) return '';
+        return flowLine(outAcc, { scope: sc, ref, key: 'card:' + c.id, kind: 'out', amount: amt,
+          label: `<span class="card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}${statementBadge(c, p.period_date)}</span>` });
+      }),
+    ].join('');
     return `
       <div class="period-card period-subcard">
         <div class="ph">
           <div><span class="tag">${p.period_type}</span></div>
           <div>
             <button class="icon-btn edit" data-edit="${p.id}" title="Edit" aria-label="Edit">✎</button>
-            <button class="icon-btn" data-archive="${p.id}" title="Archive" aria-label="Archive">📦</button>
           </div>
         </div>
 
         <div class="flow flow-in">
-          <div class="flow-head">↓ Money in</div>
-          <div class="line"><span class="lbl">💰 Salary</span><span class="val">${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
-          <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(p.previous_savings)}</span></div>
-          <div class="line"><span class="lbl">Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span>${p.period_type === '15th' ? `<span class="synced-badge" style="color:var(--text-dim);background:rgba(141,149,171,.14);" title="She pays on the 30th, so this is shown for reference only - it's added to the 30th's savings instead">not counted · paid on 30th</span>` : ''}</span><span class="val"${p.period_type === '15th' ? ' style="color:var(--text-dim);font-weight:400;"' : ''}>${PESO(t.wifeyAmount)}</span></div>
-          ${combinedJustineLine}
-          ${t.otherShares.map(o => `
-            <div class="line"><span class="lbl">${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span></span><span class="val">${PESO(o.amount)}</span></div>`).join('')}
-          ${incomeItemsForPeriod(p.id).map(item => `
-            <div class="line">
-              <span class="lbl">${escapeHtml(item.label)}
-                <button class="icon-btn edit" data-edit-income="${item.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
-                <button class="icon-btn" data-del-income="${item.id}" title="Delete" aria-label="Delete">✕</button>
-              </span>
-              <span class="val">${PESO(item.amount)}</span>
-            </div>`).join('')}
+          <div class="flow-head">↓ Money in ${flowProgress(inAcc, 'in')}</div>
+          ${inLines}
           <div class="line"><span class="lbl"><button class="icon-btn" data-add-income="${p.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>
           <div class="line flow-total"><span class="lbl">Total in</span><span class="val">${PESO(t.income)}</span></div>
         </div>
 
         <div class="flow flow-out">
-          <div class="flow-head">↑ Money out</div>
-          <div class="line"><span class="lbl">General ledger <span class="synced-badge" title="Only counts general-ledger installments that add to your outflow - balance adjustments with Justine don't count here, see the Justine line for those">outflow only</span></span><span class="val">${PESO(generalLedgerInstallmentTotalForPeriod(p.id))}</span></div>
-          ${state.cards.map(c => {
-            const amt = cardTotalForPeriod(c.id, p.id);
-            if (!amt) return '';
-            return `<div class="line"><span class="lbl card-chip"><span class="sw" style="background:${c.color}"></span>${c.name}${statementBadge(c, p.period_date)}</span><span class="val">${PESO(amt)}</span></div>`;
-          }).join('')}
+          <div class="flow-head">↑ Money out ${flowProgress(outAcc, 'out')}</div>
+          ${outLines}
           <div class="line flow-total"><span class="lbl">Total out</span><span class="val">${PESO(t.outflow)}</span></div>
         </div>
 
         <div class="line savings total"><span class="lbl">Savings <span class="flow-formula">in − out</span></span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
+        <div class="notes-block">
+          <label>Notes</label>
+          <textarea data-pnotes-for="${p.id}" placeholder="Jot anything down here…">${p.notes ? escapeHtml(p.notes) : ''}</textarea>
+        </div>
       </div>`;
   }
   function emptyBoxHtml(type, mk) {
@@ -773,9 +839,12 @@ function renderSummary() {
       return;
     }
     el.innerHTML = `
-      ${collapsible
-        ? `<button class="pg-toggle" data-toggle-month="${mk}" title="Collapse this month"><span class="pg-header">▾ ${monthLabel}</span></button>`
-        : `<div class="pg-header">${monthLabel}</div>`}
+      <div class="pg-head-row">
+        ${collapsible
+          ? `<button class="pg-toggle" data-toggle-month="${mk}" title="Collapse this month"><span class="pg-header">▾ ${monthLabel}</span></button>`
+          : `<div class="pg-header">${monthLabel}</div>`}
+        <button class="icon-btn" data-archive-month="${mk}" title="Archive this month (15th + 30th)" aria-label="Archive this month">📦</button>
+      </div>
       <div class="period-subgrid">
         ${pair['15th'] ? periodBoxHtml(pair['15th'], pair) : emptyBoxHtml('15th', mk)}
         ${pair['30th'] ? periodBoxHtml(pair['30th'], pair) : emptyBoxHtml('30th', mk)}
@@ -796,7 +865,17 @@ function renderSummary() {
   });
   $$('[data-edit]').forEach(b => b.onclick = () => openPeriodModal(periods.find(p => p.id === b.dataset.edit)));
   wireRevealToggles();
-  $$('[data-archive]').forEach(b => b.onclick = () => setArchived('periods', b.dataset.archive, true, 'Period'));
+  $$('[data-archive-month]').forEach(b => b.onclick = () => {
+    const ids = periods.filter(p => monthKey(p.period_date) === b.dataset.archiveMonth).map(p => p.id);
+    setArchivedMany('periods', ids, true, new Date(b.dataset.archiveMonth + '-01T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' }));
+  });
+  $$('[data-pnotes-for]').forEach(ta => ta.onblur = async () => {
+    const per = state.periods.find(x => x.id === ta.dataset.pnotesFor);
+    if (per && ta.value === (per.notes || '')) return; // nothing changed
+    if (!dbOk(await db.from('periods').update({ notes: ta.value }).eq('id', ta.dataset.pnotesFor), 'Notes saved')) return;
+    if (per) per.notes = ta.value;
+  });
+  wireLineTicks();
   $$('[data-add-income]').forEach(b => b.onclick = () => openIncomeItemModal(null, b.dataset.addIncome));
   $$('[data-edit-income]').forEach(b => b.onclick = () => {
     const item = state.incomeItems.find(x => x.id === b.dataset.editIncome);
@@ -810,23 +889,26 @@ function renderSummary() {
 
   if (state.showArchivedPeriods && archivedPeriods.length) {
     const ag = $('#archived-period-grid');
+    const archByMonth = new Map();
     archivedPeriods.forEach(p => {
+      const mk = monthKey(p.period_date);
+      if (!archByMonth.has(mk)) archByMonth.set(mk, []);
+      archByMonth.get(mk).push(p);
+    });
+    [...archByMonth.keys()].sort((x, y) => y.localeCompare(x)).forEach(mk => {
+      const ps = archByMonth.get(mk).sort((x, y) => x.period_date.localeCompare(y.period_date));
+      const label = new Date(mk + '-01T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' });
       const el = document.createElement('div');
       el.className = 'period-card';
       el.style.opacity = '.6';
       el.innerHTML = `
         <div class="ph">
-          <div>
-            <span class="tag">${p.period_type}</span>
-            <div class="date">${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'long', year: 'numeric' })}</div>
-          </div>
-          <div><button class="icon-btn edit" data-restore="${p.id}" title="Restore" aria-label="Restore">♻️</button></div>
-        </div>
-        <div class="line"><span class="lbl">💰</span><span class="val">${salaryDisplay(p.salary)}</span></div>
-      `;
+          <div><span class="tag">${label}</span><div class="date">${ps.map(p => p.period_type).join(' + ')}</div></div>
+          <div><button class="icon-btn edit" data-restore-month="${ps.map(p => p.id).join(',')}" data-label="${label}" title="Restore this month" aria-label="Restore this month">♻️</button></div>
+        </div>`;
       ag.appendChild(el);
     });
-    $$('[data-restore]').forEach(b => b.onclick = () => setArchived('periods', b.dataset.restore, false, 'Period'));
+    $$('[data-restore-month]').forEach(b => b.onclick = () => setArchivedMany('periods', b.dataset.restoreMonth.split(','), false, b.dataset.label));
   }
 }
 
@@ -1165,16 +1247,17 @@ function renderTransactions() {
           ${rows.map(t => {
             const wShare = Number(t.wifey_share || 0);
             const jShare = Number(t.amount) - wShare;
+            const isCredit = Number(t.amount) < 0;
             let splitHtml;
-            if (wShare <= 0) splitHtml = '<span style="color:var(--text-dim);font-size:12px;">All Joven\'s</span>';
-            else if (jShare <= 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Justine\'s</span>';
+            if (wShare === 0) splitHtml = '<span style="color:var(--text-dim);font-size:12px;">All Joven\'s</span>';
+            else if (jShare === 0) splitHtml = '<span class="pill" style="background:rgba(167,139,250,.15);color:var(--purple);">All Justine\'s</span>';
             else splitHtml = `<span style="font-size:12px;">You ${PESO(jShare)} <span style="color:var(--purple);">+ Justine ${PESO(wShare)}</span></span>`;
             return `
             <tr>
               <td>${escapeHtml(t.description)}</td>
-              <td><span class="pill ${t.kind}">${t.kind === 'bill' ? 'Bill' : 'Payment plan'}</span></td>
+              <td>${isCredit ? '<span class="pill credit" title="Negative amount - cashback, points or a refund; it lowers this card\'s total">Credit</span>' : `<span class="pill ${t.kind}">${t.kind === 'bill' ? 'Bill' : 'Payment plan'}</span>`}</td>
               <td>${splitHtml}</td>
-              <td class="num">${PESO(t.amount)}</td>
+              <td class="num"${isCredit ? ' style="color:var(--green);"' : ''}>${PESO(t.amount)}</td>
               <td style="text-align:right;white-space:nowrap;">
                 <button class="icon-btn edit" data-edit-txn="${t.id}" title="Edit" aria-label="Edit">✎</button>
                 <button class="icon-btn" data-del-txn="${t.id}" title="Delete" aria-label="Delete">✕</button>
@@ -1281,6 +1364,7 @@ function openTxnModal(txn, cardId, periodId) {
         </select>
       </div>
     </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-top:-4px;">Cashback, redeemed points or a refund? Enter it as a negative amount (e.g. -750). It lowers the card's total.</p>
     <div class="field-row" style="align-items:center;gap:6px;">
       <button type="button" class="btn secondary" id="split-all-mine" style="padding:6px 10px;font-size:12px;">All mine</button>
       <button type="button" class="btn secondary" id="split-half" style="padding:6px 10px;font-size:12px;">Split 50/50</button>
@@ -1310,7 +1394,10 @@ function openTxnModal(txn, cardId, periodId) {
   $('#modal-save').onclick = async () => {
     const amount = +$('#f-amt').value || 0;
     const wifeyShare = +$('#f-wshare').value || 0;
-    if (wifeyShare < 0 || wifeyShare > amount) { toast("Justine's share can't be negative or more than the total amount"); return; }
+    // Credits (cashback, points, refunds) are negative; Justine's share then
+    // has to be negative too, between 0 and the amount.
+    const shareOk = amount >= 0 ? (wifeyShare >= 0 && wifeyShare <= amount) : (wifeyShare <= 0 && wifeyShare >= amount);
+    if (!shareOk) { toast(`Justine's share has to be between ₱0 and ${PESO(amount)}`, { error: true }); return; }
     const payload = {
       description: $('#f-desc').value.trim(),
       amount,
@@ -3139,44 +3226,49 @@ function renderJustineSummary() {
         </div>
       </div>
 
-      <div class="flow flow-in">
-        <div class="flow-head">↓ Money in</div>
-        <div class="line"><span class="lbl">💰 Paycheck budget</span><span class="val">${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button></span></div>
-        <div class="line"><span class="lbl">Previous savings</span><span class="val">${PESO(m.previous_savings || 0)}</span></div>
-        ${t.otherShares.map(o => `
-          <div class="line"><span class="lbl">${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span></span><span class="val">${PESO(o.amount)}</span></div>`).join('')}
-        ${t.passThrough.map(o => `
-          <div class="line"><span class="lbl">${escapeHtml(o.person)} <span class="synced-badge" style="color:var(--purple);background:rgba(167,139,250,.14);" title="Pays Justine back for her share of: ${escapeHtml(o.plans.join(', '))}. She still pays Joven the full share - it's in the Joven CC Total below.">⇄ via Joven's plans</span></span><span class="val">${PESO(o.amount)}</span></div>`).join('')}
-        ${justineIncomeForMonth(m.id).map(item => `
-          <div class="line">
-            <span class="lbl">${escapeHtml(item.label)}
+      ${(() => { // Money in / Money out lines with Received / Paid ticks
+        const sc = 'jmonth', ref = m.id, inAcc = [], outAcc = [];
+        const inLines = [
+          flowLine(inAcc, { scope: sc, ref, key: 'pay', kind: 'in', label: '💰 Paycheck budget', amount: Number(m.paycheck_budget), secret: true,
+            valHtml: `${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button>` }),
+          flowLine(inAcc, { label: 'Previous savings', amount: Number(m.previous_savings || 0) }),
+          ...t.otherShares.map(o => flowLine(inAcc, { scope: sc, ref, key: 'share:' + o.person.toLowerCase(), kind: 'in', amount: o.amount,
+            label: `${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span>` })),
+          ...t.passThrough.map(o => flowLine(inAcc, { scope: sc, ref, key: 'pass:' + o.person.toLowerCase(), kind: 'in', amount: o.amount,
+            label: `${escapeHtml(o.person)} <span class="synced-badge" style="color:var(--purple);background:rgba(167,139,250,.14);" title="Pays Justine back for her share of: ${escapeHtml(o.plans.join(', '))}. She still pays Joven the full share - it's in the Joven CC Total below.">⇄ via Joven's plans</span>` })),
+          ...justineIncomeForMonth(m.id).map(item => flowLine(inAcc, { scope: sc, ref, key: 'income:' + item.id, kind: 'in', amount: Number(item.amount),
+            label: `${escapeHtml(item.label)}
               <button class="icon-btn edit" data-edit-jincome="${item.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
-              <button class="icon-btn" data-del-jincome="${item.id}" title="Delete" aria-label="Delete">✕</button>
-            </span>
-            <span class="val">${PESO(item.amount)}</span>
-          </div>`).join('')}
+              <button class="icon-btn" data-del-jincome="${item.id}" title="Delete" aria-label="Delete">✕</button>` })),
+        ].join('');
+        const color = n => (state.cards.find(c => c.name.toLowerCase() === n) || {}).color;
+        const outLines = [
+          (t.jovenCc.hasP15 || t.jovenCc.hasP30)
+            ? flowLine(outAcc, { scope: sc, ref, key: 'jovencc', kind: 'out', amount: t.jovenCc.total, label: `Joven CC Total <span class="synced-badge" title="Sum of Joven's Justine line on his 15th + 30th periods this month">⇄ synced</span>` })
+            : flowLine(outAcc, { label: `Joven CC Total <span class="synced-badge" title="Sum of Joven's Justine line on his 15th + 30th periods this month">⇄ synced</span>`, amount: 0, valHtml: '<span style="color:var(--text-dim)">no periods yet</span>' }),
+          flowLine(outAcc, { scope: sc, ref, key: 'bpi', kind: 'out', amount: Number(m.bpi_total), label: `<span class="card-chip"><span class="sw" style="background:${color('bpi') || 'var(--red)'}"></span>BPI</span>` }),
+          flowLine(outAcc, { scope: sc, ref, key: 'eastwest', kind: 'out', amount: Number(m.eastwest_total), label: `<span class="card-chip"><span class="sw" style="background:${color('eastwest') || 'var(--purple)'}"></span>Eastwest</span>` }),
+          flowLine(outAcc, { scope: sc, ref, key: 'gl', kind: 'out', amount: t.generalLedger, label: 'General ledger' }),
+          ...justineBillsForMonth(m.id).map(bl => flowLine(outAcc, { scope: sc, ref, key: 'bill:' + bl.id, kind: 'out', amount: Number(bl.amount),
+            label: `${escapeHtml(bl.label)}
+              <button class="icon-btn edit" data-edit-bill="${bl.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
+              <button class="icon-btn" data-del-bill="${bl.id}" title="Delete" aria-label="Delete">✕</button>` })),
+        ].join('');
+        return `
+      <div class="flow flow-in">
+        <div class="flow-head">↓ Money in ${flowProgress(inAcc, 'in')}</div>
+        ${inLines}
         ${state.justineIncomeOk ? `<div class="line"><span class="lbl"><button class="icon-btn" data-add-jincome="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ income line</button></span><span class="val"></span></div>` : ''}
         <div class="line flow-total"><span class="lbl">Total in</span><span class="val">${PESO(t.income)}</span></div>
       </div>
 
       <div class="flow flow-out">
-        <div class="flow-head">↑ Money out</div>
-        <div class="line"><span class="lbl">Joven CC Total <span class="synced-badge" title="Sum of Joven's Justine line on his 15th + 30th periods this month">⇄ synced</span></span><span class="val">${(t.jovenCc.hasP15 || t.jovenCc.hasP30) ? PESO(t.jovenCc.total) : '<span style="color:var(--text-dim)">no periods yet</span>'}</span></div>
-        <div class="line"><span class="lbl card-chip"><span class="sw" style="background:${(state.cards.find(c => c.name.toLowerCase() === 'bpi') || {}).color || 'var(--red)'}"></span>BPI</span><span class="val">${PESO(m.bpi_total)}</span></div>
-        <div class="line"><span class="lbl card-chip"><span class="sw" style="background:${(state.cards.find(c => c.name.toLowerCase() === 'eastwest') || {}).color || 'var(--purple)'}"></span>Eastwest</span><span class="val">${PESO(m.eastwest_total)}</span></div>
-        <div class="line"><span class="lbl">General ledger</span><span class="val">${PESO(t.generalLedger)}</span></div>
-        ${justineBillsForMonth(m.id).map(b => `
-          <div class="line">
-            <span class="lbl">${escapeHtml(b.label)}
-              <button class="icon-btn edit" data-edit-bill="${b.id}" style="margin-left:6px;" title="Edit" aria-label="Edit">✎</button>
-              <button class="icon-btn" data-del-bill="${b.id}" title="Delete" aria-label="Delete">✕</button>
-            </span>
-            <span class="val">${PESO(b.amount)}</span>
-          </div>`).join('')}
+        <div class="flow-head">↑ Money out ${flowProgress(outAcc, 'out')}</div>
+        ${outLines}
         <div class="line"><span class="lbl"><button class="icon-btn" data-add-bill="${m.id}" style="width:auto;padding:2px 8px;font-size:11px;color:var(--gold);border-color:var(--gold);">+ bill</button></span><span class="val"></span></div>
         <div class="line flow-total"><span class="lbl">Total out</span><span class="val">${PESO(t.totalOutflow)}</span></div>
-      </div>
-
+      </div>`;
+      })()}
       <div class="line savings total"><span class="lbl">Savings <span class="flow-formula">in − out</span></span><span class="val" style="color:${t.savings < 0 ? 'var(--red)' : 'var(--green)'};">${PESO(t.savings)}</span></div>
       <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">
         <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;">Notes</label>
@@ -3190,6 +3282,7 @@ function renderJustineSummary() {
     if (state.expandedMonths.has(k)) state.expandedMonths.delete(k); else state.expandedMonths.add(k);
     renderJustineSummary();
   });
+  wireLineTicks();
   $$('[data-add-jincome]').forEach(btn => btn.onclick = () => openJustineIncomeModal(null, btn.dataset.addJincome));
   $$('[data-edit-jincome]').forEach(btn => btn.onclick = () => {
     const item = state.justineIncomeItems.find(x => x.id === btn.dataset.editJincome);
