@@ -867,3 +867,9 @@ tr:hover td{background:var(--surface2);}
   .line-chk-pad{width:28px;}
   .flow-prog{float:none;display:block;margin-top:2px;}
 }
+
+/* Installment card: what's still unpaid */
+.left-to-pay{display:flex;justify-content:space-between;align-items:baseline;margin-top:10px;padding:8px 10px;border-radius:8px;background:rgba(244,117,111,.08);border:1px solid rgba(244,117,111,.25);font-size:12.5px;}
+.left-to-pay em{font-style:normal;color:var(--text-dim);font-size:11px;margin-left:4px;}
+.left-to-pay b{font-size:15px;font-variant-numeric:tabular-nums;color:var(--text);}
+.left-split{font-size:11px;color:var(--text-dim);text-align:right;margin-top:4px;font-variant-numeric:tabular-nums;}
