@@ -845,3 +845,25 @@ tr:hover td{background:var(--surface2);}
 .fc-warn b{color:var(--gold);}
 
 .feeshare-warn{font-size:12px;color:var(--gold);background:rgba(227,177,88,.08);border:1px solid rgba(227,177,88,.35);border-radius:8px;padding:8px 10px;margin:-2px 0 10px;}
+
+/* ============================================================
+   Received / Paid ticks, month header, period notes, credits
+   ============================================================ */
+.line-chk{width:15px;height:15px;margin:0 8px 0 0;vertical-align:-2px;accent-color:var(--green);cursor:pointer;flex:none;}
+.line-chk-pad{display:inline-block;width:23px;}
+.line.is-done .lbl{color:var(--text-dim);text-decoration:line-through;text-decoration-color:rgba(141,149,171,.55);}
+.line.is-done .val{color:var(--text-dim) !important;}
+.flow-prog{float:right;text-transform:none;letter-spacing:0;font-weight:600;color:var(--text-dim);font-size:11px;}
+.flow-prog.all{color:var(--green);}
+.pg-head-row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:14px;}
+.pg-head-row .pg-header{margin-bottom:0;}
+.pg-head-row .pg-toggle{width:auto;flex:1;}
+.notes-block{margin-top:14px;padding-top:12px;border-top:1px solid var(--border);}
+.notes-block label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;}
+.notes-block textarea{width:100%;min-height:60px;margin-top:6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-family:inherit;font-size:13px;resize:vertical;}
+.pill.credit{background:rgba(79,216,151,.15);color:var(--green);}
+@media (max-width: 768px) {
+  .line-chk{width:20px;height:20px;}
+  .line-chk-pad{width:28px;}
+  .flow-prog{float:none;display:block;margin-top:2px;}
+}
