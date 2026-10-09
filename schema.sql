@@ -131,6 +131,17 @@ create table justine_income_items (
   amount numeric not null default 0
 );
 
+-- Received / Paid ticks on Summary lines (Joven's periods and Justine's months)
+create table line_status (
+  id uuid primary key default gen_random_uuid(),
+  scope text not null,
+  ref_id text not null,
+  line_key text not null,
+  done boolean not null default false,
+  updated_at timestamptz not null default now(),
+  unique (scope, ref_id, line_key)
+);
+
 -- App password (hashed) + any future settings, kept in DB so it can be
 -- changed from Supabase directly without redeploying the site.
 create table app_settings (
@@ -170,6 +181,7 @@ alter table app_settings enable row level security;
 alter table justine_months enable row level security;
 alter table justine_bills enable row level security;
 alter table justine_income_items enable row level security;
+alter table line_status enable row level security;
 alter table installment_schedule enable row level security;
 alter table wifey_adjustments enable row level security;
 alter table installment_items enable row level security;
@@ -183,6 +195,7 @@ create policy "allow all - app_settings" on app_settings for all using (true) wi
 create policy "allow all - justine_months" on justine_months for all using (true) with check (true);
 create policy "allow all - justine_bills" on justine_bills for all using (true) with check (true);
 create policy "allow all - justine_income_items" on justine_income_items for all using (true) with check (true);
+create policy "allow all - line_status" on line_status for all using (true) with check (true);
 create policy "allow all - wifey_adjustments" on wifey_adjustments for all using (true) with check (true);
 create policy "allow all - installment_schedule" on installment_schedule for all using (true) with check (true);
 create policy "allow all - installment_items" on installment_items for all using (true) with check (true);
