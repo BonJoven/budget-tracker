@@ -14,9 +14,17 @@ if (CONFIG_OK) {
 }
 
 const PESO = n => '₱' + Number(n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const salaryDisplay = n => state.revealSalary ? PESO(n) : '₱••••••••';
+// Each card reveals its own salary/paycheck - the eye on one card never
+// unhides the others. `key` is 'period:<id>' or 'jmonth:<id>'.
+const isRevealed = key => !!key && state.revealed.has(key);
+const salaryDisplay = (n, key) => isRevealed(key) ? PESO(n) : '₱••••••••';
+const revealBtn = key => `<button class="icon-btn" data-reveal-toggle="${key}" title="${isRevealed(key) ? 'Hide' : 'Show'}" aria-label="${isRevealed(key) ? 'Hide' : 'Show'}" style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${isRevealed(key) ? '🙈' : '👁'}</button>`;
 function wireRevealToggles() {
-  $$('[data-reveal-toggle]').forEach(b => b.onclick = () => { state.revealSalary = !state.revealSalary; renderView(); });
+  $$('[data-reveal-toggle]').forEach(b => b.onclick = () => {
+    const k = b.dataset.revealToggle;
+    if (state.revealed.has(k)) state.revealed.delete(k); else state.revealed.add(k);
+    renderView();
+  });
 }
 
 function parseStatementDay(text) {
@@ -78,7 +86,7 @@ let state = {
   view: 'summary',
   txnPeriodId: null,
   installCardId: null,
-  revealSalary: false,
+  revealed: new Set(),   // which cards currently show their salary / paycheck
   showArchivedPeriods: false,
   showArchivedMonths: false,
   showArchivedInstallments: false,
@@ -163,7 +171,7 @@ async function toggleLineStatus(scope, ref, key, done) {
 function flowLine(acc, { scope, ref, key, kind, label, amount, valHtml, valStyle, secret }) {
   const tickable = state.lineStatusOk && !!key && Number(amount) !== 0;
   const done = tickable && lineDone(scope, ref, key);
-  if (tickable) acc.push({ amount: Number(amount), done, secret: !!secret });
+  if (tickable) acc.push({ amount: Number(amount), done, secret: secret || '' });
   const word = kind === 'in' ? 'received' : 'paid';
   const box = tickable
     ? `<input type="checkbox" class="line-chk" data-ls="${scope}|${ref}|${key}" ${done ? 'checked' : ''} title="Mark as ${word}" aria-label="${word}">`
@@ -178,7 +186,7 @@ function flowProgress(acc, kind) {
   const pending = acc.filter(x => !x.done);
   const left = pending.reduce((sum, x) => sum + x.amount, 0);
   // Don't leak a hidden salary through the "still to come in" figure.
-  const leftTxt = pending.some(x => x.secret) && !state.revealSalary ? '₱••••••' : PESO(left);
+  const leftTxt = pending.some(x => x.secret && !isRevealed(x.secret)) ? '₱••••••' : PESO(left);
   return `<span class="flow-prog">${doneN}/${acc.length} ${word} · ${leftTxt} ${kind === 'in' ? 'to come in' : 'left to pay'}</span>`;
 }
 function wireLineTicks() {
@@ -755,8 +763,8 @@ function renderSummary() {
     const inAcc = [], outAcc = [];
     const is30 = p.period_type === '30th';
     const inLines = [
-      flowLine(inAcc, { scope: sc, ref, key: 'salary', kind: 'in', label: '💰 Salary', amount: Number(p.salary), secret: true,
-        valHtml: `${salaryDisplay(p.salary)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button>` }),
+      flowLine(inAcc, { scope: sc, ref, key: 'salary', kind: 'in', label: '💰 Salary', amount: Number(p.salary), secret: 'period:' + p.id,
+        valHtml: `${salaryDisplay(p.salary, 'period:' + p.id)} ${revealBtn('period:' + p.id)}` }),
       flowLine(inAcc, { label: 'Previous savings', amount: Number(p.previous_savings) }),
       flowLine(inAcc, { label: `Justine <span class="synced-badge" title="Sum of transactions tagged Justine across all cards this period">⇄ from transactions</span>${!is30 ? `<span class="synced-badge" style="color:var(--text-dim);background:rgba(141,149,171,.14);" title="She pays on the 30th, so this is shown for reference only - it's added to the 30th's savings instead">not counted · paid on 30th</span>` : ''}`,
         amount: t.wifeyAmount, valStyle: !is30 ? 'color:var(--text-dim);font-weight:400;' : '' }),
@@ -1048,6 +1056,40 @@ function openPeriodModal(period, defaultDate, defaultType) {
 
 /* ---------------- TRANSACTIONS VIEW ---------------- */
 
+// Sort order for each card's list (payment-plan rows always stay pinned on
+// top). Remembered per browser.
+const TXN_SORTS = [
+  ['added-asc', 'Date added (oldest first)'],
+  ['added-desc', 'Date added (newest first)'],
+  ['amount-desc', 'Amount (highest first)'],
+  ['amount-asc', 'Amount (lowest first)'],
+  ['name-asc', 'Name (A → Z)'],
+  ['split-justine', "Split: Justine's first"],
+  ['split-mine', 'Split: yours first'],
+  ['type', 'Type: bills, then credits'],
+];
+function txnSort() {
+  let v = 'added-asc';
+  try { v = localStorage.getItem('budget_txn_sort') || v; } catch (e) { /* private mode */ }
+  return TXN_SORTS.some(([k]) => k === v) ? v : 'added-asc';
+}
+function sortTransactions(list) {
+  const added = t => t.created_at || '';
+  const share = t => { const a = Number(t.amount); return a ? Number(t.wifey_share || 0) / a : 0; }; // 0 = all yours, 1 = all hers
+  const byAdded = (a, b) => added(a).localeCompare(added(b));
+  const cmp = {
+    'added-asc': byAdded,
+    'added-desc': (a, b) => byAdded(b, a),
+    'amount-desc': (a, b) => Number(b.amount) - Number(a.amount) || byAdded(a, b),
+    'amount-asc': (a, b) => Number(a.amount) - Number(b.amount) || byAdded(a, b),
+    'name-asc': (a, b) => (a.description || '').localeCompare(b.description || '', undefined, { sensitivity: 'base' }) || byAdded(a, b),
+    'split-justine': (a, b) => share(b) - share(a) || byAdded(a, b),
+    'split-mine': (a, b) => share(a) - share(b) || byAdded(a, b),
+    'type': (a, b) => (Number(a.amount) < 0) - (Number(b.amount) < 0) || byAdded(a, b),
+  }[txnSort()];
+  return list.slice().sort(cmp);
+}
+
 // Which pay period a card's bill is settled in: '15th', '30th', or blank/'both'
 // (shows in every period - also the fallback before the pay_period column exists).
 function cardPaidInPeriod(card, period) {
@@ -1069,10 +1111,15 @@ function renderTransactions() {
   main.innerHTML = `
     <h2>Transactions</h2>
     <div class="subtitle">Every charge, grouped by credit card. Statement totals on the Summary tab are calculated from this list.</div>
-    <div class="field-row" style="max-width:320px;margin-bottom:18px;">
+    <div class="field-row" style="max-width:560px;margin-bottom:18px;">
       <div class="field"><label>Period</label>
         <select id="period-select">
           ${activePeriods.map(p => `<option value="${p.id}" ${p.id === state.txnPeriodId ? 'selected' : ''}>${p.period_type} — ${new Date(p.period_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' })}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field"><label>Sort by</label>
+        <select id="txn-sort">
+          ${TXN_SORTS.map(([v, l]) => `<option value="${v}" ${v === txnSort() ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
       </div>
     </div>
@@ -1090,6 +1137,7 @@ function renderTransactions() {
     <div id="card-sections"></div>
   `;
   $('#period-select').onchange = e => { state.txnPeriodId = e.target.value; renderTransactions(); };
+  $('#txn-sort').onchange = e => { try { localStorage.setItem('budget_txn_sort', e.target.value); } catch (err) { /* private mode */ } renderTransactions(); };
 
   const adjustments = state.wifeyAdjustments.filter(a => a.period_id === period.id);
   const sharedEntries = justineSharedLedgerEntriesForPeriod(period.id);
@@ -1206,7 +1254,7 @@ function renderTransactions() {
     return;
   }
   state.cards.filter(c => !c.archived).forEach(card => {
-    const rows = state.transactions.filter(t => t.card_id === card.id && t.period_id === period.id);
+    const rows = sortTransactions(state.transactions.filter(t => t.card_id === card.id && t.period_id === period.id));
     const virtualRows = virtualEntriesForPeriod(period.id).filter(e => e.card_id === card.id);
     // A card only gets a section in the period it's actually paid in (its
     // "Paid on" setting). If something IS recorded against it in the other
@@ -1691,6 +1739,12 @@ function renderInstallments() {
     const principal = Number(i.principal) || 0;
     const interest = Math.max(totalToPay - principal, 0);
     const interestPct = totalToPay > 0 ? Math.round((interest / totalToPay) * 100) : 0;
+    // What's still unpaid on this plan (follows the Paid ticks in "View schedule"),
+    // and how much of that is the other person's share.
+    const unpaidRows = schedule.filter(r => !isRowPaid(r));
+    const leftToPay = unpaidRows.reduce((s2, r) => s2 + totalAmountForRow(i, r), 0);
+    const leftShare = unpaidRows.reduce((s2, r) => s2 + totalWifeyShareForRow(i, r), 0);
+    const selfName = i.owner === 'justine' ? 'Justine' : 'Joven';
 
     const el = document.createElement('div');
     el.className = 'install-item' + (done ? ' done' : '');
@@ -1703,6 +1757,12 @@ function renderInstallments() {
         <span>${done ? 'Completed' : `${paidCount} of ${schedule.length} paid`}${overdueCount ? ` <b style="color:var(--red);">· ${overdueCount} overdue</b>` : ''}</span>
         <span class="end">${done ? '✓ Paid off' : lastRow ? 'ends ' + new Date(lastRow.due_date + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }) : ''}</span>
       </div>
+      ${!done && leftToPay > 0 ? `
+      <div class="left-to-pay">
+        <span>Left to pay <em>${unpaidRows.length} payment${unpaidRows.length === 1 ? '' : 's'}</em></span>
+        <b>${PESO(leftToPay)}</b>
+      </div>
+      ${leftShare > 0 ? `<div class="left-split">${selfName} ${PESO(leftToPay - leftShare)} · <span style="color:var(--purple);">${escapeHtml(shareHolder(i))} ${PESO(leftShare)}</span></div>` : ''}` : ''}
       ${principal > 0 ? `
       <div style="margin-top:10px;">
         <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-bottom:3px;">
@@ -3229,8 +3289,8 @@ function renderJustineSummary() {
       ${(() => { // Money in / Money out lines with Received / Paid ticks
         const sc = 'jmonth', ref = m.id, inAcc = [], outAcc = [];
         const inLines = [
-          flowLine(inAcc, { scope: sc, ref, key: 'pay', kind: 'in', label: '💰 Paycheck budget', amount: Number(m.paycheck_budget), secret: true,
-            valHtml: `${salaryDisplay(m.paycheck_budget)} <button class="icon-btn" data-reveal-toggle style="width:22px;height:22px;font-size:11px;vertical-align:middle;">${state.revealSalary ? '🙈' : '👁'}</button>` }),
+          flowLine(inAcc, { scope: sc, ref, key: 'pay', kind: 'in', label: '💰 Paycheck budget', amount: Number(m.paycheck_budget), secret: 'jmonth:' + m.id,
+            valHtml: `${salaryDisplay(m.paycheck_budget, 'jmonth:' + m.id)} ${revealBtn('jmonth:' + m.id)}` }),
           flowLine(inAcc, { label: 'Previous savings', amount: Number(m.previous_savings || 0) }),
           ...t.otherShares.map(o => flowLine(inAcc, { scope: sc, ref, key: 'share:' + o.person.toLowerCase(), kind: 'in', amount: o.amount,
             label: `${escapeHtml(o.person)} <span class="synced-badge" title="Their share of: ${escapeHtml(o.plans.join(', '))}">⇄ from installments</span>` })),
